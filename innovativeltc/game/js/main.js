@@ -1,0 +1,2916 @@
+/* Runebreaker — screens, input and the run state machine.
+   The arithmetic rules live in engine.js; this file is presentation + flow. */
+
+import {
+  makeRng, newRun, generateFloor, generateHand, generateRiddle, offerRelics,
+  spawnEnemy, enemyAct, describeIntent, isLegal, evaluate, computeDamage,
+  recordAttempt, classify, factKey, skillScore, shakyFacts, difficultyLevel,
+  unlockedOps, handSize, reshuffles, FINAL_DEPTH,
+  pickDrill, drillAllowanceMs, bossFightMs, isBossFloor, expectedDrillDamage,
+  bestHitEstimate, makeRng as engineRng, typeInto, checkAnswer, formatAnswer, parseAnswer,
+  nextLevelNeeds, GATE_TRIES, parseFactKey,
+  SKILLS, WARDS, RESISTS, RELIC_BY_ID,
+} from './engine.js';
+import { RUNES, RELICS, GRADES, GRADE_BY_ID, VERSION,
+         AVATARS, unlockedAvatars, nextAvatar, avatarsEarnedBetween,
+         FLOORS_PER_AVATAR, TYPES, typeMult, seasonFor, MONSTER_BY_ID } from './data.js';
+import { CHARACTERS, CHARACTER_BY_ID, TEAM_SIZE, ownedIds, leadOf, teamOf, matchup,
+         catchChance, seasonProgress, TROPHIES, checkTrophies,
+         formOf, addXp, pendingEvolutions, evolve, evolveProgress,
+         ENERGY_MAX, MOVES, movesOf, applyMove, spendBoost } from './collection.js';
+import * as store from './storage.js';
+import { W as WORLD_W, H as WORLD_H, generateArea, walkableAt, objectAt, ONCE } from './world.js';
+import { sfx, setEnabled, isEnabled } from './sfx.js';
+
+let data = store.load();
+let profile = null;
+let run = null;
+let battle = null;
+let playClock = null;
+let manageHeroes = false;
+
+/* The season comes from the device's date. ?season=halloween (or harvest,
+   winter, none) previews another one, for a grown-up or a test. */
+const SEASON = (() => {
+  let override = null;
+  try { override = new URLSearchParams(location.search).get('season'); } catch { /* no URL */ }
+  return seasonFor(new Date(), override);
+})();
+if (SEASON) document.body.dataset.season = SEASON.id;
+
+const app = document.getElementById('app');
+const $ = sel => app.querySelector(sel);
+const $$ = sel => Array.from(app.querySelectorAll(sel));
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* A character as this hero has grown it: evolved picture, name and power. */
+const form = c => formOf(profile, c);
+const stars = n => (n > 1 ? `<span class="stars">${'\u2605'.repeat(n - 1)}</span>` : '');
+/** The picture with its evolution glow, in the character's type colour. */
+const charSpan = (f, cls = '') => `<span class="ch ${cls} evo${f.stage} t-${f.type}">${f.char}</span>`;
+
+function render(html) {
+  stopDrillTimer(); fxGen += 1; delete app.dataset.busy; app.innerHTML = html;
+  // Every new screen starts at the top (see the html, body rule in styles.css).
+  app.scrollTop = 0; window.scrollTo(0, 0);
+}
+function persist() { store.save(data); }
+
+/* Count playing time honestly: a ticking clock only while a run is live. */
+function startClock() {
+  if (playClock) return;
+  playClock = setInterval(() => {
+    if (!profile || !run || run.over) return;
+    store.todayEntry(profile).ms += 10000;
+    persist();
+  }, 10000);
+}
+
+
+/* ================================================================ boot === */
+function boot() {
+  setEnabled(data.settings?.sound !== false);
+  profile = store.activeProfile(data);
+  startClock();
+  if (!profile) screenProfiles(); else screenHub();
+}
+
+/* ============================================================ profiles === */
+function screenProfiles() {
+  render(`
+    <div class="screen center">
+      <h1 class="logo">RUNE<span>BREAKER</span></h1>
+      <p class="tag">Numbers are your weapon.</p>
+      <div class="panel">
+        <h2>Who's playing?</h2>
+        ${data.profiles.length > 1 ? '<p class="muted tiny center">Tap a hero to play as them.</p>' : ''}
+        <div class="profile-list">
+          ${data.profiles.map(p => `
+            <div class="profile-row">
+              <button class="profile-card" data-id="${p.id}" ${manageHeroes ? 'disabled' : ''}>
+                <span class="pa">${p.avatar}</span>
+                <span class="pn">${esc(p.name)}</span>
+                <span class="pd">${p.grade ? GRADE_BY_ID[p.grade].label + ' &middot; ' : ''}deepest floor ${p.records.deepest}</span>
+              </button>
+              ${manageHeroes ? `<button class="hero-del" data-del="${p.id}" aria-label="Delete ${esc(p.name)}">\u2715</button>` : ''}
+            </div>`).join('')}
+        </div>
+        ${data.profiles.length ? `<button class="btn ghost small manage" id="manageBtn">${manageHeroes ? 'Done' : 'Manage heroes'}</button>` : ''}
+        <div class="newprof">
+          <h3>${data.profiles.length ? 'Add another hero' : 'Make your hero'}</h3>
+          ${data.profiles.length ? '<p class="muted tiny">Every hero keeps their own progress, their own difficulty and their own report card. Give each kid their own.</p>' : ''}
+          <input id="newName" maxlength="12" placeholder="${data.profiles.length ? 'Their name' : 'Hero name'}" autocomplete="off">
+          <div class="avatars">${unlockedAvatars(0).map((a, i) => `<button class="av ${i === 0 ? 'on' : ''}" data-av="${a.char}" title="${a.name}">${a.char}</button>`).join('')}</div>
+          <p class="muted tiny">Twelve more heroes are earned by playing, one for every ${FLOORS_PER_AVATAR} floors beaten.</p>
+          <label class="field-label">School year</label>
+          <div class="grades">
+            ${GRADES.map(g => `<button class="grade" data-grade="${g.id}"><b>${g.label}</b><small>${g.hint}</small></button>`).join('')}
+          </div>
+          <p class="muted tiny">Only a starting point. The game works out their real level from how they answer and adjusts within a run or two, so a wrong guess fixes itself.</p>
+          <button class="btn primary" id="createProfile">${data.profiles.length ? 'Add this hero' : 'Create hero'}</button>
+        </div>
+      </div>
+      ${data.profiles.length ? '<button class="btn ghost small" id="parentBtn">Grown-ups</button>' : ''}
+      <p class="version">v${VERSION}</p>
+    </div>`);
+
+  $$('.profile-card').forEach(b => b.onclick = () => {
+    data.activeId = b.dataset.id; persist(); profile = store.activeProfile(data); sfx.tap();
+    manageHeroes = false;
+    screenHub();
+  });
+  const manageBtn = $('#manageBtn');
+  if (manageBtn) manageBtn.onclick = () => { manageHeroes = !manageHeroes; sfx.tap(); screenProfiles(); };
+  $$('[data-del]').forEach(b => b.onclick = () => {
+    const hero = data.profiles.find(x => x.id === b.dataset.del);
+    if (hero) { sfx.tap(); screenConfirmDelete(hero); }
+  });
+  let chosen = unlockedAvatars(0)[0].char;
+  let grade = 0;
+  $$('.av').forEach(b => b.onclick = () => {
+    chosen = b.dataset.av; $$('.av').forEach(x => x.classList.remove('on')); b.classList.add('on'); sfx.tap();
+  });
+  $$('.grade').forEach(b => b.onclick = () => {
+    grade = Number(b.dataset.grade);
+    $$('.grade').forEach(x => x.classList.remove('on'));
+    b.classList.add('on');
+    sfx.tap();
+  });
+  $('#createProfile').onclick = () => {
+    const name = ($('#newName').value || '').trim() || 'Hero';
+    const p = store.newProfile(name, chosen, grade);
+    data.profiles.push(p); data.activeId = p.id; persist(); profile = p; sfx.reward(); screenHub();
+  };
+  const pb = $('#parentBtn');
+  if (pb) pb.onclick = parentGate;
+}
+
+function screenConfirmDelete(hero) {
+  const answered = hero.days.reduce((n, d) => n + d.correct + d.wrong, 0);
+  const minutes = Math.round(hero.days.reduce((n, d) => n + d.ms, 0) / 60000);
+  render(`
+    <div class="screen center">
+      <div class="panel lose">
+        <h2>Delete ${esc(hero.name)}?</h2>
+        <div class="big-art">${hero.avatar}</div>
+        <p class="center">This removes <b>${answered}</b> answered problems and <b>${minutes}</b> minutes of playing, including everything the report card is built from.</p>
+        <p class="muted tiny center">There is no undo and no copy on a server. If you might want them back, back them up first.</p>
+        <button class="btn primary" id="backup">Back them up first</button>
+        <div class="row">
+          <button class="btn ghost" id="cancel">Keep them</button>
+          <button class="btn danger" id="confirm">Delete for good</button>
+        </div>
+      </div>
+    </div>`);
+  $('#backup').onclick = () => { sfx.tap(); screenBackup([hero], () => screenConfirmDelete(hero)); };
+  $('#cancel').onclick = () => { sfx.tap(); screenProfiles(); };
+  $('#confirm').onclick = () => {
+    data.profiles = data.profiles.filter(x => x.id !== hero.id);
+    if (data.activeId === hero.id) { data.activeId = null; profile = null; run = null; }
+    if (!data.profiles.length) manageHeroes = false;
+    persist(); sfx.lose(); screenProfiles();
+  };
+}
+
+/* ================================================================= hub === */
+function screenHub() {
+  // An evolution earned but never shown (the app was closed mid-fight) plays here.
+  if (pendingEvolutions(profile).length) return withEvolutions(screenHub);
+  const upNext = nextAvatar(profile.records.floorsBeaten || 0);
+  const level = difficultyLevel(profile.mastery, profile.grade);
+  const ops = unlockedOps(profile.mastery, profile.grade);
+  const team = teamOf(profile);
+  const monsters = CHARACTERS.filter(c => c.kind !== 'hero');
+  const owned = new Set(ownedIds(profile));
+  const caughtCount = monsters.filter(c => owned.has(c.id)).length;
+  const trophyCount = Object.keys(profile.trophies || {}).length;
+  const season = SEASON ? seasonProgress(profile, SEASON.id) : null;
+  render(`
+    <div class="screen center">
+      <h1 class="logo small">RUNE<span>BREAKER</span></h1>
+      ${SEASON ? `<div class="season-banner">
+        <span class="sb-icon">${SEASON.icon}</span>
+        <div><b>${SEASON.name} season!</b> ${SEASON.blurb} until ${SEASON.until}.
+        <small>Caught ${season.caught} of ${season.total} ${SEASON.name} monsters. Anything you catch is yours to keep.</small></div>
+      </div>` : ''}
+      <div class="panel">
+        <div class="hero-row">
+          <button class="pa big as-button" id="looksBtn" title="Change your team">${charSpan(form(team[0]))}</button>
+          <div>
+            <h2>${esc(profile.name)}</h2>
+            <p class="muted">Deepest floor <b>${profile.records.deepest}</b> &middot; ${profile.records.runs} runs &middot; ${profile.records.bossesFelled} bosses felled</p>
+            <p class="muted tiny">Team: ${team.map(c => `${form(c).char}${TYPES[c.type].icon}`).join(' ')} &middot; ${upNext ? `next hero in ${upNext.away} floor${upNext.away === 1 ? '' : 's'}` : 'every hero earned'}</p>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn" id="bookBtn">\u{1F4D6} Team &amp; Monsters <small>${caughtCount}/${monsters.length}</small></button>
+          <button class="btn" id="trophyBtn">\u{1F3C6} Trophies <small>${trophyCount}/${TROPHIES.length}</small></button>
+        </div>
+        <div class="runes-owned">
+          ${['+', '-', '*', '/', '^'].map(op => `<span class="rune-chip ${ops.includes(op) ? 'on' : 'off'}">${RUNES[op].glyph}</span>`).join('')}
+          <span class="muted tiny">Runes you can find &middot; Challenge level ${level}</span>
+        </div>
+        ${nextLevelHtml()}
+        <button class="btn primary big" id="startRun">Start a run</button>
+        ${data.profiles.length > 1 ? '<button class="btn big" id="versusBtn">\u2694\uFE0F Battle a friend</button>' : ''}
+        ${profile.records.wins ? `<button class="btn big" id="startEndless">Endless run</button>
+        <p class="muted tiny center">Cleared the Deep ${profile.records.wins} time${profile.records.wins === 1 ? '' : 's'}. Best endless floor: ${profile.records.bestEndless || 0}.</p>` : ''}
+        <div class="row">
+          <button class="btn ghost" id="switchBtn">Switch / add hero</button>
+          <button class="btn ghost" id="soundBtn">Sound: ${isEnabled() ? 'on' : 'off'}</button>
+        </div>
+      </div>
+      <button class="btn ghost small" id="parentBtn">Grown-ups</button>
+    </div>`);
+
+  $('#startRun').onclick = () => { sfx.tap(); beginRun(false); };
+  const endlessBtn = $('#startEndless');
+  if (endlessBtn) endlessBtn.onclick = () => { sfx.tap(); beginRun(true); };
+  $('#looksBtn').onclick = () => { sfx.tap(); screenLooks(screenHub); };
+  $('#bookBtn').onclick = () => { sfx.tap(); screenLooks(screenHub); };
+  const vb = $('#versusBtn');
+  if (vb) vb.onclick = () => { sfx.tap(); screenVersusPick(); };
+  $('#trophyBtn').onclick = () => { sfx.tap(); screenTrophies(screenHub); };
+  $('#switchBtn').onclick = () => { data.activeId = null; persist(); screenProfiles(); };
+  $('#soundBtn').onclick = () => {
+    setEnabled(!isEnabled()); data.settings.sound = isEnabled(); persist(); sfx.tap(); screenHub();
+  };
+  $('#parentBtn').onclick = parentGate;
+}
+
+/* Every trophy, earned or not. Locked ones say exactly what to do, which is
+   most of what makes a trophy case worth opening. */
+function screenTrophies(onDone) {
+  const got = profile.trophies || {};
+  render(`
+    <div class="screen center">
+      <div class="panel">
+        <h2>Trophies</h2>
+        <p class="muted tiny center">${Object.keys(got).length} of ${TROPHIES.length}. Every one is for the maths.</p>
+        <div class="trophy-grid">
+          ${TROPHIES.map(t => `<div class="trophy ${got[t.id] ? 'won' : ''}">
+            <span class="ti">${got[t.id] ? t.icon : '\u{1F512}'}</span>
+            <b>${esc(t.name)}</b>
+            <small>${esc(t.text)}</small>
+          </div>`).join('')}
+        </div>
+        <button class="btn primary" id="done">Done</button>
+      </div>
+    </div>`);
+  $('#done').onclick = () => { sfx.tap(); onDone(); };
+}
+
+/* What the next level needs, in a kid's words. Levels open one at a time by
+   showing the current level's own topics. */
+function nextLevelHtml() {
+  const n = nextLevelNeeds(profile.mastery, profile.grade);
+  if (!n) return '<p class="next-level">\u{1F31F} Top level reached.</p>';
+  const want = n.gate.need === n.gate.skills.length ? '' : ` (any ${n.gate.need} of ${n.gate.skills.length})`;
+  const items = n.gate.skills.map(x => `<span class="${x.ok ? 'done' : ''}">${x.ok ? '\u2705' : '\u2B1C'} ${esc(x.label)} ${Math.min(x.tries, GATE_TRIES)}/${GATE_TRIES}</span>`).join('');
+  return `<div class="next-level"><b>To reach level ${n.next}${want}:</b> ${items}<small>Try each at least ${GATE_TRIES} times and get 4 out of 5 right. New ones show up more in the timed problems.</small></div>`;
+}
+
+/* Announce a new level once, on the next win or loss after it arrives. */
+function levelUpLine() {
+  const now = difficultyLevel(profile.mastery, profile.grade);
+  const seen = profile.records.levelSeen;
+  profile.records.levelSeen = Math.max(seen || 0, now);
+  if (!seen || now <= seen) return '';
+  return `<p class="levelup-line">\u2B06\uFE0F <b>Level up! Challenge level ${now}.</b> New kinds of problems are on the way.</p>`;
+}
+
+function beginRun(endless = false) {
+  run = newRun(Date.now() % 2147483647, profile, endless);
+  run.area = generateArea(run.rng, run.depth, run.floorNodes);
+  // Gold won battling a friend is spent on the next run.
+  if (profile.meta.bankGold) { run.player.gold += profile.meta.bankGold; profile.meta.bankGold = 0; }
+  profile.records.runs += 1;
+  persist();
+  screenWorld();
+}
+
+/* =============================================================== world === */
+/* Each floor is a small area to walk around, Pokemon style: tall grass with
+   wild monsters, houses with trainers, the healer, the shop and the riddle
+   hall, a locked chest, townspeople with quests and hints, and a gate on to
+   the next floor that opens once a fight here has been won. Every third
+   floor the gate is the boss tower. The layout comes from world.js. */
+const HEALER_SHARE = 0.25;
+const WORLD_LOOK = {
+  none:      { tree: '\u{1F333}', deco: ['\u{1F33C}', '\u{1F337}'] },
+  halloween: { tree: '\u{1F332}', deco: ['\u{1F383}', '\u{1F578}️', '\u{1F342}'] },
+  harvest:   { tree: '\u{1F333}', deco: ['\u{1F342}', '\u{1F33E}', '\u{1F341}'] },
+  winter:    { tree: '\u{1F332}', deco: ['❄️', '⛄'] },
+};
+const OBJ_ART = { trainer: '\u{1F3E0}', healer: '\u{1F3E5}', shop: '\u{1F3EA}', riddle: '\u{1F3DB}️',
+                  chest: '\u{1F9F0}', gate: '⛩️', boss: '\u{1F3F0}' };
+const ENCOUNTER_CHANCE = 0.2;   // per step in tall grass
+const ENCOUNTER_SURE = 6;       // steps in grass before one is certain
+let worldRepeat = null;
+let dialogQueue = null;
+
+function stopWorldRepeat() { if (worldRepeat) { clearInterval(worldRepeat); worldRepeat = null; } }
+
+function worldTileHtml(a, x, y) {
+  const look = WORLD_LOOK[SEASON ? SEASON.id : 'none'];
+  const t = a.tiles[y][x];
+  const o = objectAt(a, x, y);
+  let inner = '';
+  let extra = '';
+  if (o) {
+    const done = ONCE.has(o.kind) && o.done;
+    if (o.kind === 'npc') inner = o.npc.art;
+    else if (o.kind === 'chest' && done) inner = '';
+    else inner = OBJ_ART[o.kind];
+    if (o.kind === 'trainer' && !done) extra = '<b class="wmark">!</b>';
+    if (o.kind === 'gate' && !a.wins) extra = '<b class="wmark lock">\u{1F512}</b>';
+    if (o.kind === 'npc' && !run.quest) extra = '<b class="wmark">?</b>';
+    return `<div class="wt t-${t} obj o-${o.kind} ${done ? 'used' : ''}" data-x="${x}" data-y="${y}" data-k="obj" data-o="${o.kind}" ${done ? 'data-done="1"' : ''}>${inner}${extra}</div>`;
+  }
+  if (t === 'tree') inner = look.tree;
+  else if (t === 'tall') inner = '<span class="blades"></span>';
+  else if (t === 'ground' && a.deco.includes(`${x},${y}`)) inner = look.deco[(x * 7 + y * 3) % look.deco.length];
+  return `<div class="wt t-${t}" data-x="${x}" data-y="${y}" data-k="${t}">${inner}</div>`;
+}
+
+function questLine() {
+  if (!run.quest) return '';
+  const q = run.quest;
+  return `<span class="wquest">\u{1F4DC} ${esc(q.text)} <b>${Math.min(q.have, q.need)}/${q.need}</b></span>`;
+}
+
+function screenWorld() {
+  stopWorldRepeat();
+  const a = run.area;
+  const lead = form(teamOf(profile)[0]);
+  const where = a.boss ? 'Boss floor' : `Route ${run.depth}`;
+  render(`
+    <div class="screen world-screen">
+      ${topBar()}
+      <div class="wtitle"><b>Floor ${run.depth}${run.endless ? '' : ` of ${FINAL_DEPTH}`}</b> <span>${where}</span>
+        <span class="wwins">${a.boss ? '\u{1F3F0} The boss is at the top' : a.wins ? '⛩️ Gate open' : '\u{1F33F} Win a fight to open the gate'}</span></div>
+      ${questLine()}
+      <div class="world-wrap">
+        <div class="world" id="world" data-w="${WORLD_W}" data-h="${WORLD_H}">
+          ${a.tiles.map((row, y) => row.map((_, x) => worldTileHtml(a, x, y)).join('')).join('')}
+          <div class="hero-w evo${lead.stage} t-${lead.type}" id="hero" data-x="${a.pos.x}" data-y="${a.pos.y}" style="--hx:${a.pos.x};--hy:${a.pos.y}">${lead.char}</div>
+        </div>
+        <div class="wdialog" id="wdialog" hidden></div>
+      </div>
+      <div class="wcontrols">
+        <div class="dpad">
+          <button class="dk up" data-d="0,-1" aria-label="Up">▲</button>
+          <button class="dk left" data-d="-1,0" aria-label="Left">◀</button>
+          <button class="dk right" data-d="1,0" aria-label="Right">▶</button>
+          <button class="dk down" data-d="0,1" aria-label="Down">▼</button>
+        </div>
+        <p class="whelp">Walk into houses, people and the gate to use them. Tall grass \u{1F33F} hides wild monsters.</p>
+      </div>
+    </div>`);
+
+  $$('.dk').forEach(b => {
+    const [dx, dy] = b.dataset.d.split(',').map(Number);
+    const go = ev => {
+      ev.preventDefault();
+      stopWorldRepeat();
+      worldStep(dx, dy);
+      worldRepeat = setInterval(() => { if (!$('#world') || dialogOpen()) return stopWorldRepeat(); worldStep(dx, dy); }, 190);
+    };
+    b.addEventListener('pointerdown', go);
+    ['pointerup', 'pointerleave', 'pointercancel'].forEach(t => b.addEventListener(t, stopWorldRepeat));
+  });
+}
+
+const dialogOpen = () => { const d = $('#wdialog'); return !!(d && !d.hidden); };
+
+/* A Pokemon-style text box. Lines are read one tap at a time; the last can
+   offer buttons. */
+function showDialog(lines, buttons = [{ label: 'OK' }]) {
+  stopWorldRepeat();
+  dialogQueue = { lines: [].concat(lines), buttons };
+  drawDialog();
+}
+
+function drawDialog() {
+  const d = $('#wdialog');
+  if (!d || !dialogQueue) return;
+  const { lines, buttons } = dialogQueue;
+  const last = lines.length === 1;
+  d.hidden = false;
+  d.innerHTML = `<p>${lines[0]}</p>
+    <div class="wdbtns">${last
+      ? buttons.map((b, i) => `<button class="btn ${i === 0 ? 'primary' : 'ghost'} small" data-db="${i}">${b.label}</button>`).join('')
+      : '<button class="btn primary small" data-db="next">▼</button>'}</div>`;
+  d.querySelectorAll('[data-db]').forEach(btn => btn.onclick = () => {
+    sfx.tap();
+    if (btn.dataset.db === 'next') { dialogQueue.lines.shift(); return drawDialog(); }
+    const b = buttons[Number(btn.dataset.db)];
+    closeDialog();
+    if (b && b.action) b.action();
+  });
+}
+
+function closeDialog() {
+  dialogQueue = null;
+  const d = $('#wdialog');
+  if (d) { d.hidden = true; d.innerHTML = ''; }
+}
+
+function moveHero() {
+  const a = run.area, h = $('#hero');
+  if (!h) return;
+  h.style.setProperty('--hx', a.pos.x);
+  h.style.setProperty('--hy', a.pos.y);
+  h.dataset.x = a.pos.x; h.dataset.y = a.pos.y;
+}
+
+function worldStep(dx, dy) {
+  if (!$('#world') || dialogOpen() || app.dataset.busy) return;
+  const a = run.area;
+  const nx = a.pos.x + dx, ny = a.pos.y + dy;
+  const obj = objectAt(a, nx, ny);
+  if (obj) { stopWorldRepeat(); return interact(obj); }
+  if (!walkableAt(a, nx, ny)) {
+    anim($('#hero'), [{ transform: 'translate(0,0)' }, { transform: `translate(${dx * 4}px,${dy * 4}px)` }, { transform: 'translate(0,0)' }], { duration: 120, composite: 'add' });
+    return;
+  }
+  a.pos = { x: nx, y: ny };
+  a.steps += 1;
+  moveHero();
+  if (a.calm > 0) { a.calm -= 1; return; }
+  if (a.tiles[ny][nx] === 'tall') {
+    a.grassSteps = (a.grassSteps || 0) + 1;
+    if (a.grassSteps >= ENCOUNTER_SURE || run.rng() < ENCOUNTER_CHANCE) {
+      a.grassSteps = 0;
+      stopWorldRepeat();
+      wildEncounter();
+    }
+  }
+}
+
+function wildEncounter() {
+  const w = $('#world');
+  app.dataset.busy = '1';
+  sfx.hurt();
+  if (w && !reducedMotion()) w.classList.add('encounter');
+  const gen = fxGen;
+  setTimeout(() => {
+    if (gen !== fxGen) return;
+    delete app.dataset.busy;
+    run.area.active = null;
+    enterNode({ type: 'battle', wild: true });
+  }, reducedMotion() ? 0 : 520);
+}
+
+/* Back from a house, a riddle or a fight: mark it used and return to the
+   spot in the world they left from. Outside the world (no area), old flow. */
+function leaveNode() {
+  const a = run.area;
+  if (!a) return nextFloor();
+  if (a.active && ONCE.has(a.active.kind)) a.active.done = true;
+  a.active = null;
+  a.calm = 2; // a couple of quiet steps after anything, so a fight never chains straight into another
+  screenWorld();
+}
+
+function interact(o) {
+  const a = run.area;
+  const used = ONCE.has(o.kind) && o.done;
+  const go = (fn) => () => { a.active = o; fn(); };
+  switch (o.kind) {
+    case 'npc': return talkTo(o);
+    case 'trainer':
+      if (used) return showDialog(`${o.trainer.art} <b>${esc(o.trainer.name)}</b>: You beat me fair and square. Good luck up ahead!`);
+      return showDialog([`${o.trainer.art} <b>${esc(o.trainer.name)}</b> wants to battle!`,
+                         `${o.trainer.art} "I have two monsters. Beat them both and you win a relic!"`],
+        [{ label: 'Battle!', action: go(() => enterNode({ type: 'trainer', trainer: o.trainer })) }, { label: 'Not yet' }]);
+    case 'healer':
+      if (used) return showDialog('\u{1F3E5} The healer is resting. There is another one on a later floor.');
+      return showDialog('\u{1F3E5} A healer! Rest here once to get some health back, or train to grow stronger.',
+        [{ label: 'Go in', action: go(screenRest) }, { label: 'Later' }]);
+    case 'shop':
+      if (used) return showDialog('\u{1F3EA} The trader has packed up for today.');
+      return showDialog('\u{1F3EA} A trader with relics and potions. You can come in once.',
+        [{ label: 'Go in', action: go(screenShop) }, { label: 'Later' }]);
+    case 'riddle':
+      if (used) return showDialog('\u{1F3DB}️ The riddle hall is closed. Its riddle has been answered.');
+      return showDialog('\u{1F3DB}️ The riddle hall. Solve its riddle for a relic, but a wrong answer stings.',
+        [{ label: 'Go in', action: go(screenRiddle) }, { label: 'Later' }]);
+    case 'chest':
+      if (used) return showDialog('An empty chest.');
+      return showDialog('\u{1F9F0} A chest with a number lock. Work out the code to open it.',
+        [{ label: 'Try the lock', action: go(screenTreasure) }, { label: 'Later' }]);
+    case 'gate':
+      if (!a.wins) return showDialog(['\u{1F512} The gate is sealed.', 'Win a fight in this area to open it. The tall grass \u{1F33F} is full of monsters!']);
+      return showDialog(`⛩️ The gate is open. On to floor ${run.depth + 1}?`,
+        [{ label: 'Go!', action: () => { sfx.tap(); nextFloor(); } }, { label: 'Stay here' }]);
+    case 'boss':
+      return showDialog(['\u{1F3F0} The boss waits inside.', 'Boss fights are all timed questions. Ready?'],
+        [{ label: 'Enter!', action: go(() => enterNode({ type: 'boss' })) }, { label: 'Not yet' }]);
+    default: return null;
+  }
+}
+
+/* ------------------------------------------------------- quests & hints */
+const QUESTS = [
+  { kind: 'wins', need: 2, text: 'Win 2 fights in the tall grass', reward: { gold: 20 } },
+  { kind: 'catch', need: 1, text: 'Catch a new monster', reward: { heal: 15 } },
+  { kind: 'flawless', need: 1, text: 'Win a fight with no wrong answers', reward: { gold: 30 } },
+  { kind: 'type', need: 1, text: 'Win a fight with a super effective matchup', reward: { gold: 20 } },
+  { kind: 'streak', need: 8, text: 'Get 8 right in a row', reward: { heal: 12 } },
+];
+
+function rewardText(r) {
+  return r.gold ? `\u{1FA99} +${r.gold} gold` : `❤️ +${r.heal} health`;
+}
+
+/* Called after every win. Returns a line for the win screen when a quest finishes. */
+function questProgress({ wild, caught, flawless, superEff, best }) {
+  const q = run.quest;
+  if (!q) return '';
+  if (q.kind === 'wins' && wild) q.have += 1;
+  if (q.kind === 'catch' && caught) q.have += 1;
+  if (q.kind === 'flawless' && flawless) q.have += 1;
+  if (q.kind === 'type' && superEff) q.have += 1;
+  if (q.kind === 'streak') q.have = Math.max(q.have, best);
+  if (q.have < q.need) return '';
+  const p = run.player;
+  if (q.reward.gold) p.gold += q.reward.gold;
+  if (q.reward.heal) p.hp = Math.min(p.maxHp, p.hp + q.reward.heal);
+  run.quest = null;
+  run.questsDone = (run.questsDone || 0) + 1;
+  return `<p class="quest-line">\u{1F4DC} Quest complete for ${esc(q.from)}: ${esc(q.text)}! ${rewardText(q.reward)}</p>`;
+}
+
+/* A useful thing to say: the fact they keep missing, what the next level
+   needs, or how types and catching work. */
+function hintLine() {
+  const tips = [];
+  const shaky = shakyFacts(profile.mastery, 5);
+  if (shaky.length) {
+    const f = parseFactKey(shaky[Math.floor(run.rng() * shaky.length)].key);
+    if (f) tips.push(`Psst. <b>${f.a} ${RUNES[f.op].glyph} ${f.b} = ${evaluate(f.a, f.op, f.b)}</b>. Say it three times and you'll never miss it again!`);
+  }
+  const n = nextLevelNeeds(profile.mastery, profile.grade);
+  if (n && !n.gate.passed) {
+    const todo = n.gate.skills.filter(x => !x.ok).map(x => x.label.toLowerCase());
+    if (todo.length) tips.push(`To reach level ${n.next}, practise ${todo.join(' and ')}. They come up in the timed problems.`);
+  }
+  const types = Object.values(TYPES);
+  const t = types[Math.floor(run.rng() * types.length)];
+  tips.push(`${t.icon} ${t.name} beats ${TYPES[t.beats[0]].icon} ${TYPES[t.beats[0]].name}. Switch fighters in battle to use it!`);
+  tips.push('A fight with no wrong answers almost always catches the monster.');
+  tips.push('Every right answer helps whoever is fighting evolve.');
+  return tips[Math.floor(run.rng() * tips.length)];
+}
+
+function talkTo(o) {
+  const who = `${o.npc.art} <b>${esc(o.npc.name)}</b>`;
+  const q = run.quest;
+  if (!q) {
+    const next = QUESTS[Math.floor(run.rng() * QUESTS.length)];
+    return showDialog([`${who}: Could you help me? ${esc(next.text)}, and I'll give you ${rewardText(next.reward)}.`],
+      [{ label: 'Sure!', action: () => { run.quest = { ...next, have: 0, from: o.npc.name }; sfx.reward(); screenWorld(); } },
+       { label: 'Just a hint', action: () => showDialog(`${who}: ${hintLine()}`) }]);
+  }
+  return showDialog([`${who}: ${hintLine()}`,
+                     `\u{1F4DC} Your quest for ${esc(q.from)}: ${esc(q.text)} (${Math.min(q.have, q.need)}/${q.need}).`]);
+}
+
+function topBar({ inBattle = false } = {}) {
+  const p = run.player;
+  return `
+    <div class="topbar">
+      ${inBattle ? '' : `<span class="hp-pill">\u2764\uFE0F ${Math.max(0, p.hp)}/${p.maxHp}</span>`}
+      <span class="gold-pill">\u{1FA99} ${p.gold}</span>
+      <span class="depth-pill">Floor ${run.depth}${run.endless ? '' : `/${FINAL_DEPTH}`}</span>
+      ${inBattle && battle && battle.team.length > 1 ? `<span class="team-chips">${teamChips()}</span>`
+        : `<span class="runes-pill">${p.runes.map(o => RUNES[o].glyph).join(' ')}</span>`}
+      ${inBattle && p.relics.length ? `<span class="relic-tray inline">${p.relics.map(id => `<span class="relic-mini" title="${esc(RELIC_BY_ID[id].text)}">${RELIC_BY_ID[id].art}</span>`).join('')}</span>` : ''}
+    </div>`;
+}
+
+function nextFloor() {
+  /* The floor they were standing on is now beaten. Counted across every run
+     and never reset, so dying on floor four after a good run still leaves
+     them four floors closer to the next hero. */
+  const before = profile.records.floorsBeaten || 0;
+  profile.records.floorsBeaten = before + 1;
+  const earned = avatarsEarnedBetween(before, profile.records.floorsBeaten);
+
+  run.depth += 1;
+  run.stats.deepest = Math.max(run.stats.deepest, run.depth);
+  if (run.depth > profile.records.deepest) profile.records.deepest = run.depth;
+  if (run.endless && run.depth > (profile.records.bestEndless || 0)) profile.records.bestEndless = run.depth;
+  run.floorNodes = generateFloor(run.rng, run.depth);
+  run.area = generateArea(run.rng, run.depth, run.floorNodes);
+  persist();
+
+  if (earned.length) return screenAvatarEarned(earned);
+  screenWorld();
+}
+
+/* Earning a hero is the one reward in the game that is not about the fight,
+   so it gets its own screen rather than a line in the log. */
+function screenAvatarEarned(earned) {
+  const a = earned[0];
+  const rest = earned.slice(1);
+  sfx.win();
+  render(`
+    <div class="screen center">
+      <div class="panel win">
+        <h2>NEW HERO EARNED</h2>
+        <div class="big-art huge">${a.char}</div>
+        <p class="center"><b>${esc(a.name)}</b> is yours, for beating ${profile.records.floorsBeaten} floors.</p>
+        ${rest.length ? `<p class="center">Also earned: ${rest.map(x => `${x.char} ${esc(x.name)}`).join(', ')}</p>` : ''}
+        <div class="row">
+          <button class="btn ghost" id="later">Keep going</button>
+          <button class="btn primary" id="wear">Wear ${a.char}</button>
+        </div>
+      </div>
+    </div>`);
+  $('#wear').onclick = () => {
+    const ids = teamOf(profile).map(c => c.id).filter(x => x !== a.id);
+    profile.party = [a.id, ...ids].slice(0, TEAM_SIZE);
+    profile.heroId = a.id;
+    profile.avatar = a.char;
+    persist(); sfx.reward(); screenWorld();
+  };
+  $('#later').onclick = () => { sfx.tap(); screenWorld(); };
+}
+
+/* Team and Monster Book in one place. The team (up to three) is who they
+   can switch between in a fight; the first is the lead. Below it, every
+   character in the game: heroes earned by beating floors, and monsters that
+   join by being caught. Uncaught ones show as a "?" with their type, so a kid
+   knows what to hunt for, and seasonal ones say when they can be met. */
+let teamMsg = '';
+function screenLooks(onDone) {
+  const owned = new Set(ownedIds(profile));
+  const team = teamOf(profile);
+  const inTeam = new Set(team.map(c => c.id));
+  const beaten = profile.records.floorsBeaten || 0;
+  const monsters = CHARACTERS.filter(c => c.kind !== 'hero');
+  const caughtCount = monsters.filter(c => owned.has(c.id)).length;
+  const MONTH = { halloween: 'October', harvest: 'November', winter: 'December' };
+
+  const card = c => {
+    const have = owned.has(c.id);
+    const t = TYPES[c.type];
+    const f = form(c);
+    const sub = have ? `${esc(f.name)}${f.stage > 1 ? ' ' + '\u2605'.repeat(f.stage - 1) : ''}`
+      : c.kind === 'hero' ? `${c.at} floors`
+      : c.season ? `${MONTH[c.season]} only` : '???';
+    return `<button class="look ${have ? '' : 'locked'} ${inTeam.has(c.id) ? 'on' : ''}" ${have ? `data-pick="${c.id}"` : 'disabled'}>
+      <span class="lk">${have ? charSpan(f) : c.kind === 'hero' ? '\u{1F512}' : '❓'}</span>
+      <span class="lt" title="${t.name}">${t.icon}</span>
+      <small>${sub}</small>
+    </button>`;
+  };
+  const section = (title, list) => list.length ? `<h3 class="book-h">${title}</h3><div class="looks">${list.map(card).join('')}</div>` : '';
+  const next = nextAvatar(beaten);
+
+  render(`
+    <div class="screen center">
+      <div class="panel">
+        <h2>Your team</h2>
+        <p class="muted tiny center">Up to ${TEAM_SIZE}. Switch between them in a fight to get the best type matchup. The first one leads. Every right answer a character makes in a fight helps it evolve.</p>
+        <div class="team-slots">
+          ${Array.from({ length: TEAM_SIZE }, (_, i) => {
+            const c = team[i];
+            if (!c) return '<div class="slot-card empty">Empty</div>';
+            const f = form(c);
+            const prog = evolveProgress(profile, c.id);
+            return `<div class="slot-card ${i === 0 ? 'lead' : ''}">
+              <button class="slot-main" data-lead="${c.id}" title="${i === 0 ? 'Leads the team' : 'Make lead'}">
+                <span class="lk">${charSpan(f)}</span><small>${TYPES[c.type].icon} ${esc(f.name)} ${stars(f.stage)}</small>
+                ${prog ? `<span class="evo-bar" title="Right answers until it evolves"><i style="width:${Math.min(100, prog.have / prog.need * 100)}%"></i></span>
+                <small class="evo-count">${prog.have >= prog.need ? 'Ready to evolve!' : `${prog.have}/${prog.need} to evolve`}</small>`
+                  : '<small class="evo-count">Fully evolved</small>'}
+                <em>${i === 0 ? 'Lead' : 'Make lead'}</em>
+              </button>
+              ${team.length > 1 ? `<button class="slot-x" data-drop="${c.id}" aria-label="Take ${esc(c.name)} off the team">✕</button>` : ''}
+            </div>`;
+          }).join('')}
+        </div>
+        ${teamMsg ? `<p class="team-msg">${teamMsg}</p>` : ''}
+        <div class="type-key">${Object.values(TYPES).map(t => `<span>${t.icon} ${t.name} beats ${t.beats.map(b => TYPES[b].icon).join('')}</span>`).join('')}</div>
+        <h2 class="book-title">Monster Book</h2>
+        <p class="muted tiny center">Caught <b>${caughtCount}</b> of ${monsters.length}. Win a fight to try to catch that monster: the better your maths in the fight, the better the chance.${next ? ` Next hero: ${next.char} in ${next.away} floors.` : ''}</p>
+        ${section('Heroes', CHARACTERS.filter(c => c.kind === 'hero'))}
+        ${section('Monsters', monsters.filter(c => c.kind === 'monster' && !c.season))}
+        ${section('Bosses', monsters.filter(c => c.kind === 'boss' && !c.season))}
+        ${section('\u{1F383} Halloween', monsters.filter(c => c.season === 'halloween'))}
+        ${section('\u{1F983} Thanksgiving', monsters.filter(c => c.season === 'harvest'))}
+        ${section('\u{1F384} Christmas', monsters.filter(c => c.season === 'winter'))}
+        <button class="btn primary" id="done">Done</button>
+      </div>
+    </div>`);
+
+  const save = ids => {
+    profile.party = ids;
+    profile.heroId = ids[0];
+    profile.avatar = CHARACTER_BY_ID[ids[0]].char;
+    persist();
+  };
+  const ids = team.map(c => c.id);
+  $$('[data-pick]').forEach(b => b.onclick = () => {
+    const id = b.dataset.pick;
+    teamMsg = '';
+    if (ids.includes(id)) {
+      if (ids.length === 1) teamMsg = 'Your team needs at least one.';
+      else save(ids.filter(x => x !== id));
+    } else if (ids.length >= TEAM_SIZE) {
+      teamMsg = `Your team is full. Tap ✕ on one to make room.`;
+    } else save([...ids, id]);
+    sfx.tap(); screenLooks(onDone);
+  });
+  $$('[data-drop]').forEach(b => b.onclick = () => { teamMsg = ''; save(ids.filter(x => x !== b.dataset.drop)); sfx.tap(); screenLooks(onDone); });
+  $$('[data-lead]').forEach(b => b.onclick = () => {
+    teamMsg = '';
+    save([b.dataset.lead, ...ids.filter(x => x !== b.dataset.lead)]); sfx.reward(); screenLooks(onDone);
+  });
+  $('#done').onclick = () => { teamMsg = ''; sfx.tap(); onDone(); };
+}
+
+function enterNode(node) {
+  const level = difficultyLevel(profile.mastery, profile.grade);
+  const ctx = {
+    runes: run.player.runes,
+    level,
+    playerMaxHp: run.player.maxHp,
+    season: SEASON ? SEASON.id : null,
+  };
+
+  /* Enemy health is budgeted against what this player can actually hit for,
+     and turns alternate, so BOTH kinds have to count. A built strike at
+     eighth grade level hits for a few hundred; a handed-out percentage
+     question hits for tens. Budgeting on the built ceiling alone made every
+     fight run about twice its intended length, and the extra turns were extra
+     damage taken. It only bit at the top grades, where the tile ceiling grows
+     quadratically while drill answers do not.
+
+     Sampled on a throwaway rng so the run's own seeded stream stays in step. */
+  const drillDamage = drillsOn()
+    ? expectedDrillDamage(engineRng(Math.floor(run.rng() * 2 ** 31)),
+                          profile.mastery, run.player.runes, level)
+    : 0;
+  const built = bestHitEstimate(run.player.runes, level);
+  /* An ordinary fight alternates, so health is budgeted on the average of the
+     two turn types, while armor is sized against the weaker one so it cannot
+     wipe out a drill turn entirely. */
+  const mixed = drillsOn()
+    ? { ...ctx, ceiling: (built + drillDamage) / 2, armorBase: drillDamage }
+    : ctx;
+  // A duel is every turn a question, so both are sized against questions.
+  const duelCtx = drillsOn()
+    ? { ...ctx, duel: true, ceiling: drillDamage, armorBase: drillDamage }
+    : ctx;
+
+  switch (node.type) {
+    case 'battle': return startBattle(spawnEnemy(run.rng, run.depth, mixed), { gold: 8 + run.depth * 2, wild: !!node.wild });
+    /* A trainer sends out two monsters, one after the other, with health
+       carrying over between them. Ordinary strength each: two ordinary fights
+       cost about what one elite used to, and pay the elite's relic. */
+    case 'trainer': return startBattle(spawnEnemy(run.rng, run.depth, mixed), {
+      gold: 16 + run.depth * 3, relic: true,
+      trainer: { ...node.trainer, queue: [spawnEnemy(run.rng, run.depth, mixed)] },
+    });
+    case 'elite':  return startBattle(spawnEnemy(run.rng, run.depth, { ...mixed, elite: true }), { gold: 16 + run.depth * 3, relic: true });
+    case 'boss':   return startBattle(spawnEnemy(run.rng, run.depth, { ...duelCtx, boss: true }), { gold: 30 + run.depth * 4, relic: true, boss: true });
+    case 'riddle': return screenRiddle();
+    case 'treasure': return screenTreasure();
+    case 'shop':   return screenShop();
+    case 'rest':   return screenRest();
+    default:       return nextFloor();
+  }
+}
+
+/* ============================================================== battle === */
+function startBattle(enemy, reward) {
+  const team = teamOf(profile);
+  battle = {
+    enemy,
+    reward,
+    team,
+    fighter: team[0],
+    tiles: [],
+    sel: { aIdx: null, op: null, bIdx: null },
+    lockedId: null,
+    pendingJam: false,
+    reshuffleLeft: reshuffles(run.player),
+    firstHit: true,
+    mercyLeft: run.player.relics.includes('mercy') ? 1 : 0,
+    shieldTurns: 0,
+    typed: '',
+    exprReadyAt: null,
+    lastWrong: null,
+    turn: 1,
+    mode: 'build',
+    drill: null,
+    /* A boss duel is nothing but asked questions: no tile building, and one
+       clock over the whole fight on top of the per-question one. */
+    allDrills: !!reward.boss && drillsOn(),
+    fightMs: 0,
+    fightStart: performance.now(),
+    stats: { right: 0, wrong: 0, best: 0, fastMs: null }, // for the win screen's recap
+    log: [`A ${enemy.name} blocks your way!`],
+  };
+  /* What one written answer is worth as damage in this fight. Sampled from
+     the drill picker so a question hits for about what a calculation would. */
+  battle.askedDamage = Math.max(1, Math.round(expectedDrillDamage(
+    engineRng(Math.floor(run.rng() * 2 ** 31)),
+    profile.mastery, run.player.runes, difficultyLevel(profile.mastery, profile.grade))));
+
+  if (battle.allDrills) {
+    battle.fightMs = bossFightMs(profile.mastery, run.depth);
+    battle.log = [`${enemy.name} challenges you to a duel. Answer, or be hit.`];
+  }
+  applyFighter();
+  // Energy is the run's, not the fight's: a short early fight would otherwise
+  // end before a single move could be afforded.
+  run.player.energy = run.player.energy || 0;
+  run.player.guard = false;
+  run.player.boost = null;
+  const o = TYPES[enemy.type];
+  if (reward.trainer) battle.log[0] = `${reward.trainer.art} ${reward.trainer.name} sent out ${enemy.name}!`;
+  else if (reward.wild) battle.log[0] = `A wild ${enemy.name} appeared!`;
+  battle.log[0] = battle.log[0].replace(enemy.name, `${enemy.name} (${o.icon} ${o.name})`);
+  battle.log.push(matchupText(false));
+  dealHand();
+  if (battle.allDrills) { battle.turn = 0; return nextTurn(); }
+  renderBattle();
+}
+
+/* The matchup both ways for whoever is fighting right now. */
+function applyFighter() {
+  const e = battle.enemy;
+  e.typeEdge = typeMult(e.type, battle.fighter.type);
+}
+
+/* Swapping fighter is free and allowed on any turn, including mid-question,
+   so it never costs time on a clock. It updates the field in place rather
+   than re-rendering, because a re-render restarts a drill. */
+function switchFighter(id) {
+  if (app.dataset.busy) return;
+  const next = battle.team.find(c => c.id === id);
+  if (!next || next.id === battle.fighter.id) return;
+  battle.fighter = next;
+  applyFighter();
+  sfx.tap();
+  const hero = $('#heroSprite');
+  if (hero) {
+    const f = form(next);
+    hero.textContent = f.char;
+    hero.className = `sprite hero evo${f.stage} t-${f.type}`;
+    anim(hero, [{ transform: 'scale(.3)', opacity: 0 }, { transform: 'scale(1.15)', opacity: 1 }, { transform: 'scale(1)' }], { duration: 300 });
+  }
+  const nm = $('.ibox.hero .nm span');
+  if (nm) nm.innerHTML = `${TYPES[next.type].icon} ${esc(form(next).name)}${stars(form(next).stage)}`;
+  const intent = $('.ibox.foe .intent');
+  if (intent) { const it = describeIntent(battle.enemy); intent.textContent = `Next: ${it.icon} ${it.text}`; }
+  $$('.tchip').forEach(b => b.classList.toggle('on', b.dataset.fighter === next.id));
+  battle.log.push(`Go, ${form(next).char} ${esc(form(next).name)}! ${matchupText(false)}`);
+  refreshMovesBtn();
+  const log = $('.log');
+  if (log) log.innerHTML = battle.log.slice(-2).map(l => `<div>${l}</div>`).join('');
+}
+
+/* ---------------------------------------------------------------- moves */
+/* The battle log shares its row with the moves button: a row of its own
+   would push the keypad off a phone screen. */
+function logRow() {
+  return `<div class="log-row"><div class="log">${battle.log.slice(-2).map(l => `<div>${l}</div>`).join('')}</div>${movesBtnHtml()}</div>`;
+}
+
+function movesBtnHtml() {
+  const known = movesOf(profile, battle.fighter);
+  const ready = known.some(m => m.cost <= run.player.energy);
+  return `<button class="moves-btn ${ready ? 'ready' : ''}" id="movesBtn" title="Special moves">
+    <span>\u2728</span><b>${run.player.energy || 0}</b><small>\u26A1 energy</small></button>`;
+}
+
+function refreshMovesBtn() {
+  const b = $('#movesBtn');
+  if (b) { b.outerHTML = movesBtnHtml(); wireMoves(); }
+}
+
+function wireMoves() {
+  const b = $('#movesBtn');
+  if (b) b.onclick = ev => {
+    ev.stopPropagation();
+    if (app.dataset.busy) return;
+    const f = battle.fighter;
+    openMoves({ name: form(f).name, type: f.type, known: movesOf(profile, f).length, energy: run.player.energy || 0, onUse: useMove });
+  };
+}
+
+/* A sheet over the keypad listing the fighter's moves. Moves it has not
+   learned yet are shown too, with when they come, so evolving has a pull. */
+function openMoves({ name, type, known, energy, onUse }) {
+  closeMoves();
+  const all = MOVES[type] || MOVES.light;
+  const sheet = document.createElement('div');
+  sheet.className = 'moves-sheet';
+  sheet.innerHTML = `
+    <div class="ms-head"><b>${TYPES[type].icon} ${esc(name)}'s moves</b><span>\u26A1 ${energy} energy</span>
+      <button class="ms-x" aria-label="Close">\u2715</button></div>
+    <p class="ms-note">Every right answer gives 1 energy. Using a move does not use up your turn.</p>
+    ${all.map((m, i) => {
+      const learned = i < known;
+      const can = learned && energy >= m.cost;
+      return `<button class="ms-move ${can ? '' : 'off'}" ${can ? `data-mv="${i}"` : 'disabled'}>
+        <span class="ms-name">${learned ? '' : '\u{1F512} '}${m.name}</span>
+        <span class="ms-cost">\u26A1 ${m.cost}</span>
+        <small>${learned ? m.text : `Learned at evolution stage ${i + 1}.`}</small>
+      </button>`;
+    }).join('')}`;
+  app.appendChild(sheet);
+  sheet.querySelector('.ms-x').onclick = () => { sfx.tap(); closeMoves(); };
+  sheet.querySelectorAll('[data-mv]').forEach(b => b.onclick = () => onUse(all[Number(b.dataset.mv)]));
+}
+
+function closeMoves() { app.querySelectorAll('.moves-sheet').forEach(x => x.remove()); }
+
+function useMove(mv) {
+  const p = run.player, e = battle.enemy, f = battle.fighter;
+  if ((run.player.energy || 0) < mv.cost || app.dataset.busy) return;
+  closeMoves();
+  run.player.energy -= mv.cost;
+  const out = applyMove(mv, p, e, f.type, e.type);
+  const bits = [];
+  if (out.dmg) bits.push(`${out.dmg} damage${effNote(f.type, e.type)}`);
+  if (out.heal) bits.push(`healed ${out.heal}`);
+  if (mv.fx.guard) bits.push('the next attack will be blocked');
+  if (mv.fx.boost) bits.push(mv.fx.hits > 1 ? `next ${mv.fx.hits} hits powered up` : 'next hit powered up');
+  if (mv.fx.skip) bits.push(`${e.name} will skip its next move`);
+  if (mv.fx.curse) bits.push(`${e.name} is weakened`);
+  if (mv.fx.unshield) bits.push('shields broken');
+  battle.log.push(`\u2728 ${esc(form(f).name)} used <b>${mv.name}</b>! ${bits.join(', ')}.`);
+  sfx.crit();
+  const foe = $('#foeSprite'), hero = $('#heroSprite');
+  if (out.dmg) { shake(foe, true); popNumber(foe, `-${out.dmg}`, 'crit'); setBar('foeHp', e.hp, e.maxHp); }
+  if (out.heal) { popNumber(hero, `+${out.heal}`, 'heal'); setBar('heroHp', p.hp, p.maxHp); }
+  if (!out.dmg && hero) anim(hero, [{ filter: 'drop-shadow(0 0 0 #fff)' }, { filter: 'drop-shadow(0 0 16px #ffe14a)' }, { filter: 'drop-shadow(0 0 0 #fff)' }], { duration: 420 });
+  persist();
+  if (e.hp <= 0) {
+    stopDrillTimer();
+    return playFx([{ type: 'faint', who: 'foe' }], nextTurn);
+  }
+  // A built turn can simply redraw; a timed question must not, or its clock restarts.
+  if (battle.mode === 'build') return renderBattle();
+  const log = $('.log');
+  if (log) log.innerHTML = battle.log.slice(-2).map(l => `<div>${l}</div>`).join('');
+  const intent = $('.ibox.foe .intent');
+  if (intent) { const it = describeIntent(e); intent.textContent = `Next: ${it.icon} ${it.text}`; }
+  refreshMovesBtn();
+}
+
+/* The matchup in words, Pokemon style. Goes in the battle log at the start
+   of a fight and whenever they switch, so it costs no screen space. */
+function matchupText(withLead = true) {
+  const e = battle.enemy, f = battle.fighter;
+  const m = matchup(f.type, e.type);
+  const t = TYPES[f.type], o = TYPES[e.type];
+  const lead = withLead ? `${esc(form(f).name)} is ${t.icon} ${t.name}. ` : '';
+  // Kept to one line on a phone: the log has two lines and the keypad needs the rest.
+  return lead + (m.edge === 'clash' ? `<b>${t.icon} vs ${o.icon}: super effective both ways!</b>`
+    : m.edge === 'strong' ? `<b class="good">${t.icon} ${t.name} beats ${o.icon} ${o.name}: super effective!</b>`
+    : m.edge === 'weak' ? `<b class="bad">${o.icon} ${o.name} beats ${t.icon} ${t.name}.</b> Try switching!`
+    : m.edge === 'risky' ? `<b class="bad">${o.icon} ${o.name} hits ${t.icon} ${t.name} hard!</b>`
+    : `${t.icon} ${t.name} vs ${o.icon} ${o.name}: an even match.`);
+}
+
+/* Team chips sit in the top bar during a fight: a row of their own pushed
+   the keypad off a phone screen. */
+function teamChips() {
+  const e = battle.enemy;
+  return battle.team.map(c => {
+    const m = matchup(c.type, e.type);
+    const mark = m.edge === 'strong' ? '\u25B2' : m.edge === 'clash' ? '\u2694\uFE0F' : m.edge === 'weak' || m.edge === 'risky' ? '\u25BC' : '';
+    return `<button class="tchip ${c.id === battle.fighter.id ? 'on' : ''} ${m.edge}" data-fighter="${c.id}" title="${esc(c.name)}">
+      <span class="tc">${form(c).char}</span><span class="tt">${TYPES[c.type].icon}</span>${mark ? `<b>${mark}</b>` : ''}
+    </button>`;
+  }).join('');
+}
+
+function wireTeam() {
+  $$('.tchip').forEach(b => b.onclick = ev => { ev.stopPropagation(); switchFighter(b.dataset.fighter); });
+}
+
+function dealHand() {
+  battle.tiles = generateHand(run.rng, {
+    mastery: profile.mastery,
+    runes: run.player.runes,
+    size: handSize(run.player),
+    depth: run.depth,
+    grade: profile.grade,
+  });
+}
+
+/* Swap out only the two tiles that were spent, so the hand feels like a hand. */
+function replaceTiles(idxs) {
+  const fresh = generateHand(run.rng, {
+    mastery: profile.mastery, runes: run.player.runes,
+    size: handSize(run.player), depth: run.depth, grade: profile.grade,
+  });
+  idxs.forEach((idx, k) => { battle.tiles[idx] = fresh[k % fresh.length]; });
+}
+
+function selectedExpression() {
+  const { aIdx, op, bIdx } = battle.sel;
+  if (aIdx === null || op === null || bIdx === null) return null;
+  const a = battle.tiles[aIdx].value, b = battle.tiles[bIdx].value;
+  if (!isLegal(a, op, b)) return null;
+  return { a, op, b, result: evaluate(a, op, b) };
+}
+
+/* Shared by the built turn and the drill turn: both need the player to see
+   armor, the ward, the resist and what is coming next. */
+/* ============================================================= field === */
+/* A Pokemon-style stage: the enemy top right with its name box top left, the
+   hero bottom left with theirs bottom right. The hero is whichever of the
+   twenty they have earned and picked, so what they unlocked is what fights. */
+const pct = (v, m) => Math.max(0, Math.min(100, (v / m) * 100));
+const hpTone = p2 => (p2 > 50 ? 'good' : p2 > 20 ? 'warn' : 'bad');
+
+function hpBar(id, hp, max) {
+  const p2 = pct(hp, max);
+  return `<div class="bar hp ${hpTone(p2)}" id="${id}"><span style="width:${p2}%"></span><b>${Math.max(0, hp)} / ${max}</b></div>`;
+}
+
+function fieldHtml() {
+  const e = battle.enemy, p = run.player;
+  const ward = WARDS[e.ward];
+  const resist = RESISTS[e.resist] || RESISTS.none;
+  const intent = describeIntent(e);
+  const tags = [
+    e.armor ? `<span class="tag armor">\u{1F6E1}\uFE0F Armor ${e.armor}</span>` : '',
+    !e.duel && ward.id !== 'none' ? `<span class="tag ward">\u{1F52E} ${ward.label}</span>` : '',
+    !e.duel && resist.id !== 'none' ? `<span class="tag resist">\u{1F6AB} ${resist.label(e.resistAt)}</span>` : '',
+    e.shield ? `<span class="tag shield">\u{1F512} Shield: hit EXACTLY ${e.shield}</span>` : '',
+  ].join('');
+  return `
+    <div class="field ${e.boss ? 'boss' : ''} ${e.elite ? 'elite' : ''}">
+      <div class="ibox foe">
+        <div class="nm"><span>${TYPES[e.type] ? TYPES[e.type].icon + ' ' : ''}${esc(e.name)}</span></div>
+        ${hpBar('foeHp', e.hp, e.maxHp)}
+        <div class="intent">Next: ${intent.icon} ${intent.text}</div>
+      </div>
+      <div class="plat foe"></div>
+      <div class="sprite foe" id="foeSprite">${e.art}</div>
+      <div class="plat hero"></div>
+      <div class="sprite hero evo${form(battle.fighter).stage} t-${battle.fighter.type}" id="heroSprite">${form(battle.fighter).char}</div>
+      <div class="ibox hero">
+        <div class="nm"><span>${TYPES[battle.fighter.type].icon} ${esc(form(battle.fighter).name)}${stars(form(battle.fighter).stage)}</span><small class="combo ${p.combo ? 'on' : ''}">\u{1F525}${p.combo}</small></div>
+        ${hpBar('heroHp', p.hp, p.maxHp)}
+      </div>
+    </div>
+    ${tags ? `<div class="enemy-tags">${tags}</div>` : ''}`;
+}
+
+/* =============================================================== fx === */
+/* The maths always resolves first and instantly, so scoring, balance and the
+   learning record are untouched by any of this. What follows is a short
+   replay of what just happened, drawn over the screen as it was, and then
+   the game carries on to the next state.
+
+   Quick by design, about half a second a hit, because every second
+   here is a second not spent on maths across eighty problems a run. Tapping
+   or pressing any key skips it. It never runs while a clock is counting: the
+   per-question clock starts only after it ends, and the duel clock is paused
+   for its length. Honours reduced-motion, which also keeps the test bots fast. */
+const CONFETTI = ['#f5c04a', '#ef4b5c', '#4ade80', '#59a5ff', '#a678ff', '#ff8a3d'];
+const MOVE = { '+': 'Joining Strike', '-': 'Taking Strike', '*': 'Stacking Strike',
+               '/': 'Splitting Strike', '^': 'Raising Strike' };
+let fxGen = 0;
+let fxSkip = null;
+
+function reducedMotion() {
+  try { return window.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch { return false; }
+}
+
+function anim(el, frames, opts) {
+  if (!el || !el.animate) return null;
+  try { return el.animate(frames, { fill: 'forwards', easing: 'ease-out', ...opts }); } catch { return null; }
+}
+
+function setBar(id, hp, max) {
+  const bar = app.querySelector(`#${id}`);
+  if (!bar) return;
+  const p2 = pct(hp, max);
+  bar.className = `bar hp ${hpTone(p2)}`;
+  bar.querySelector('span').style.width = `${p2}%`;
+  bar.querySelector('b').textContent = `${Math.max(0, hp)} / ${max}`;
+}
+
+function caption(html) {
+  const log = app.querySelector('.log');
+  if (log) log.innerHTML = `<div class="fx-caption">${html}</div>`;
+}
+
+function centreOf(el, field) {
+  const r = el.getBoundingClientRect(), f = field.getBoundingClientRect();
+  return { x: r.left + r.width / 2 - f.left, y: r.top + r.height / 2 - f.top };
+}
+
+function popNumber(target, text, kind) {
+  const field = app.querySelector('.field');
+  if (!field || !target) return;
+  const c = centreOf(target, field);
+  const n = document.createElement('div');
+  n.className = `fx-num ${kind}`;
+  n.textContent = text;
+  n.style.left = `${c.x}px`;
+  n.style.top = `${c.y}px`;
+  field.appendChild(n);
+  anim(n, [
+    { opacity: 0, transform: 'translate(-50%, -50%) scale(.6)' },
+    { opacity: 1, transform: 'translate(-50%, calc(-50% - 8px)) scale(1.2)', offset: 0.25 },
+    { opacity: 0, transform: 'translate(-50%, calc(-50% - 22px)) scale(1)' },
+  ], { duration: 720 });
+}
+
+function shake(el, strong = false) {
+  const d = strong ? 9 : 6;
+  anim(el, [
+    { transform: 'translateX(0)', filter: 'brightness(1)' },
+    { transform: `translateX(-${d}px)`, filter: 'brightness(2.4)' },
+    { transform: `translateX(${d}px)`, filter: 'brightness(1.6)' },
+    { transform: `translateX(-${d / 2}px)` },
+    { transform: 'translateX(0)', filter: 'brightness(1)' },
+  ], { duration: 260 });
+}
+
+function effNote(att, def) {
+  const m = typeMult(att, def);
+  return m > 1 ? ' Super effective!' : m < 1 ? ' Not very effective.' : '';
+}
+
+/* The Pokemon line every kid knows, added to a hit's caption. */
+function effText(mult) {
+  if (mult > 1) return ' <span class="eff super">It\'s super effective!</span>';
+  if (mult < 1) return ' <span class="eff weak">It\'s not very effective...</span>';
+  return '';
+}
+
+/* One beat of the replay. Returns how long it takes, so the next can follow. */
+function runBeat(b, gen, later) {
+  const field = app.querySelector('.field');
+  const hero = app.querySelector('#heroSprite');
+  const foe = app.querySelector('#foeSprite');
+  if (!field || !hero || !foe) return 0;
+  const who = esc(profile.name), them = esc(battle.enemy.name);
+
+  if (b.type === 'strike' || b.type === 'whiff') {
+    caption(`${who} used <b>${b.move}</b>!`);
+    const h = centreOf(hero, field), o = centreOf(foe, field);
+    const orb = document.createElement('div');
+    orb.className = `fx-orb ${b.kind || ''}`;
+    orb.textContent = b.value;
+    orb.style.left = `${h.x}px`;
+    orb.style.top = `${h.y}px`;
+    field.appendChild(orb);
+    anim(hero, [{ transform: 'translate(0,0)' }, { transform: 'translate(12px,-10px)' }, { transform: 'translate(0,0)' }], { duration: 240 });
+    const travel = b.type === 'whiff' ? 0.55 : 1;
+    anim(orb, [
+      { transform: 'translate(-50%,-50%) scale(.5)', opacity: 1 },
+      { transform: `translate(calc(-50% + ${(o.x - h.x) * travel}px), calc(-50% + ${(o.y - h.y) * travel}px)) scale(1.1)`, opacity: b.type === 'whiff' ? 0 : 1 },
+    ], { duration: 280, easing: 'ease-in' });
+    later(280, () => {
+      orb.remove();
+      if (b.type === 'whiff') {
+        caption(`${who} used <b>${b.move}</b>... it fizzled!`);
+        sfx.wrong();
+        return;
+      }
+      if (b.kind === 'absorbed') {
+        caption(`The shield swallowed it! Only <b>exactly ${b.shield}</b> breaks it.`);
+        anim(foe, [{ filter: 'drop-shadow(0 0 0 gold)' }, { filter: 'drop-shadow(0 0 14px gold)' }, { filter: 'drop-shadow(0 0 0 gold)' }], { duration: 300 });
+        popNumber(foe, 'BLOCKED', 'blocked');
+        sfx.hurt();
+        return;
+      }
+      shake(foe, b.kind === 'warded' || b.kind === 'shatter');
+      popNumber(foe, `-${b.dmg}`, b.kind === 'warded' || b.kind === 'shatter' ? 'crit' : 'hit');
+      setBar('foeHp', b.hp, b.max);
+      const eff = effText(typeMult(battle.fighter.type, battle.enemy.type));
+      caption((b.kind === 'shatter' ? `EXACT! The shield shatters, <b>${b.dmg}</b> damage!`
+            : b.kind === 'warded' ? `Ward broken! <b>${b.dmg}</b> damage!`
+            : `It hit for <b>${b.dmg}</b>!`) + eff);
+      (b.kind === 'shatter' ? sfx.shatter : b.kind === 'warded' ? sfx.crit : sfx.hit)();
+    });
+    return 580;
+  }
+
+  if (b.type === 'foeAttack') {
+    caption(`${them} ${b.big ? 'unleashes a big attack' : 'attacks'}!`);
+    const h = centreOf(hero, field), o = centreOf(foe, field);
+    anim(foe, [
+      { transform: 'translate(0,0)' },
+      { transform: `translate(${(h.x - o.x) * 0.35}px, ${(h.y - o.y) * 0.35}px)` },
+      { transform: 'translate(0,0)' },
+    ], { duration: 320 });
+    later(170, () => {
+      shake(hero, b.big);
+      popNumber(hero, `-${b.dmg}`, 'hurt');
+      setBar('heroHp', b.hp, b.max);
+      caption(`${them} hit you for <b>${b.dmg}</b>.` + effText(battle.enemy.typeEdge || 1));
+      sfx.hurt();
+    });
+    return 500;
+  }
+
+  if (b.type === 'parry') {
+    caption(`${who} parried!`);
+    const h = centreOf(hero, field), o = centreOf(foe, field);
+    anim(foe, [
+      { transform: 'translate(0,0)' },
+      { transform: `translate(${(h.x - o.x) * 0.3}px, ${(h.y - o.y) * 0.3}px)` },
+      { transform: 'translate(0,0)' },
+    ], { duration: 300 });
+    later(150, () => {
+      anim(hero, [{ filter: 'drop-shadow(0 0 0 #59a5ff)' }, { filter: 'drop-shadow(0 0 16px #59a5ff)' }, { filter: 'drop-shadow(0 0 0 #59a5ff)' }], { duration: 320 });
+      popNumber(hero, b.leak ? `-${b.leak}` : 'PARRY', b.leak ? 'hurt small' : 'blocked');
+      if (b.leak) setBar('heroHp', b.hp, b.max);
+    });
+    return 420;
+  }
+
+  if (b.type === 'foeBuff') {
+    caption(b.text);
+    const tint = { heal: '#4ade80', armor: '#59a5ff', shield: '#f5c04a', jam: '#a678ff' }[b.kind] || '#fff';
+    anim(foe, [{ filter: `drop-shadow(0 0 0 ${tint})` }, { filter: `drop-shadow(0 0 16px ${tint})` }, { filter: `drop-shadow(0 0 0 ${tint})` }], { duration: 380 });
+    if (b.kind === 'heal') { popNumber(foe, `+${b.amount}`, 'heal'); setBar('foeHp', b.hp, b.max); }
+    return 400;
+  }
+
+  if (b.type === 'faint') {
+    const el = b.who === 'foe' ? foe : hero;
+    caption(`${b.who === 'foe' ? them : who} fainted!`);
+    anim(el, [
+      { transform: 'translateY(0)', opacity: 1 },
+      { transform: 'translateY(8px) rotate(-6deg)', opacity: 1, offset: 0.3 },
+      { transform: 'translateY(46px) rotate(-10deg)', opacity: 0 },
+    ], { duration: 560, easing: 'ease-in' });
+    return 640; // silent: the win and lose screens play their own fanfare
+  }
+  return 0;
+}
+
+/* Play a list of beats, then call done. Skippable, and a no-op under
+   reduced motion, in which case the final screen simply appears. */
+function playFx(beats, done) {
+  const field = app.querySelector('.field');
+  if (!beats.length || !field || reducedMotion()) {
+    // Still make a sound, so skipping the picture does not also skip the feedback.
+    const loud = beats.find(b => b.kind === 'shatter' || b.kind === 'warded')
+      || beats.find(b => b.type === 'strike') || beats.find(b => b.type === 'foeAttack') || beats.find(b => b.type === 'whiff');
+    if (loud) {
+      if (loud.kind === 'shatter') sfx.shatter();
+      else if (loud.kind === 'warded') sfx.crit();
+      else if (loud.type === 'strike') sfx.hit();
+      else if (loud.type === 'foeAttack') sfx.hurt();
+      else sfx.wrong();
+    }
+    return done();
+  }
+
+  const gen = ++fxGen;
+  const t0 = performance.now();
+  let finished = false;
+  let timer = null;
+  const later = (ms, fn) => setTimeout(() => { if (gen === fxGen && !finished) fn(); }, ms);
+
+  app.dataset.busy = '1';
+  const shield = document.createElement('div');
+  shield.className = 'fx-skip';
+  shield.title = 'Tap to skip';
+  app.appendChild(shield);
+
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    fxSkip = null;
+    shield.remove();
+    delete app.dataset.busy;
+    // The duel clock does not run while a move is being shown.
+    if (battle && battle.fightMs) battle.fightStart += performance.now() - t0;
+    done();
+  };
+  fxSkip = finish;
+  shield.onclick = finish;
+
+  let i = 0;
+  const step = () => {
+    if (finished || gen !== fxGen) return;
+    if (i >= beats.length) return finish();
+    const ms = runBeat(beats[i++], gen, later);
+    timer = setTimeout(step, ms);
+  };
+  step();
+}
+
+function renderBattle() {
+  const e = battle.enemy, p = run.player;
+  const expr = selectedExpression();
+  const { aIdx, op, bIdx } = battle.sel;
+
+  const tileBtn = (t, i) => {
+    const locked = t.id === battle.lockedId;
+    const isA = i === aIdx, isB = i === bIdx;
+    let disabled = locked || (isA && bIdx !== null) ;
+    // Once A and an operator are picked, grey out tiles that cannot legally follow.
+    if (!isA && op !== null && aIdx !== null && bIdx === null) {
+      if (!isLegal(battle.tiles[aIdx].value, op, t.value)) disabled = true;
+    }
+    if (isA || isB) disabled = false;
+    return `<button class="tile ${isA ? 'sel-a' : ''} ${isB ? 'sel-b' : ''} ${locked ? 'locked' : ''}"
+              data-i="${i}" ${disabled && !isA && !isB ? 'disabled' : ''}>${locked ? '\u{1F512}' : t.value}</button>`;
+  };
+
+  render(`
+    <div class="screen battle">
+      ${topBar({ inBattle: true })}
+      ${fieldHtml()}
+
+      ${logRow()}
+
+      <div class="expr-area">
+        <div class="expr">
+          <span class="slot ${aIdx !== null ? 'filled' : ''}">${aIdx !== null ? battle.tiles[aIdx].value : '?'}</span>
+          <span class="slot op ${op ? 'filled' : ''}">${op ? RUNES[op].glyph : '?'}</span>
+          <span class="slot ${bIdx !== null ? 'filled' : ''}">${bIdx !== null ? battle.tiles[bIdx].value : '?'}</span>
+          <span class="eq">=</span>
+          <span class="answer ${battle.typed ? 'filled' : ''}">${battle.typed || '_'}</span>
+        </div>
+        ${expr ? `<div class="expr-hint muted tiny">Type the answer, then STRIKE.</div>`
+               : `<div class="expr-hint muted tiny">Pick a tile, a rune, then another tile.</div>`}
+      </div>
+
+      <div class="hand">${battle.tiles.map(tileBtn).join('')}</div>
+
+      <div class="runes">
+        ${p.runes.map(o => `<button class="rune ${op === o ? 'on' : ''}" data-op="${o}">${RUNES[o].glyph}</button>`).join('')}
+        <button class="btn ghost tiny" id="clearSel">Clear</button>
+        <button class="btn ghost tiny" id="reshuffle" ${battle.reshuffleLeft ? '' : 'disabled'}>Reshuffle (${battle.reshuffleLeft})</button>
+      </div>
+
+      ${keypadHtml({ submitId: 'strike', submitLabel: 'STRIKE', ready: !!(expr && battle.typed), extras: false })}
+
+    </div>`);
+
+  $$('.tile').forEach(b => b.onclick = () => onTile(+b.dataset.i));
+  $$('.rune').forEach(b => b.onclick = () => onRune(b.dataset.op));
+  $$('.key').forEach(b => b.onclick = () => onKey(b.dataset.k));
+  $('#clearSel').onclick = () => { battle.sel = { aIdx: null, op: null, bIdx: null }; battle.typed = ''; battle.exprReadyAt = null; sfx.tap(); renderBattle(); };
+  $('#reshuffle').onclick = () => {
+    if (!battle.reshuffleLeft) return;
+    battle.reshuffleLeft -= 1; dealHand();
+    battle.sel = { aIdx: null, op: null, bIdx: null }; battle.typed = ''; battle.exprReadyAt = null;
+    sfx.tap(); renderBattle();
+  };
+  const st = $('#strike'); if (st) st.onclick = submitStrike;
+  wireTeam();
+  wireMoves();
+}
+
+function onTile(i) {
+  const s = battle.sel;
+  if (battle.tiles[i].id === battle.lockedId) return;
+  sfx.tap();
+  if (s.aIdx === i) { s.aIdx = null; s.bIdx = null; }
+  else if (s.bIdx === i) { s.bIdx = null; }
+  else if (s.aIdx === null) { s.aIdx = i; }
+  else { s.bIdx = i; }
+  battle.typed = '';
+  battle.exprReadyAt = selectedExpression() ? performance.now() : null;
+  renderBattle();
+}
+
+function onRune(op) {
+  sfx.tap();
+  battle.sel.op = battle.sel.op === op ? null : op;
+  battle.typed = '';
+  battle.exprReadyAt = selectedExpression() ? performance.now() : null;
+  renderBattle();
+}
+
+function onKey(k) {
+  if (k === 'back') battle.typed = battle.typed.slice(0, -1);
+  else if (battle.typed.length < 5) battle.typed += k;
+  sfx.tap();
+  renderBattle();
+}
+
+/* A short, concrete strategy nudge after a miss. Immediate feedback beats a
+   wall, and re-doing the same fact next turn is the point. */
+function hintFor(a, op, b) {
+  if (op === '*') {
+    const [lo, hi] = a <= b ? [a, b] : [b, a];
+    if (lo % 2 === 0) return `${hi} x ${lo} is ${hi} x ${lo / 2} doubled: ${hi * (lo / 2)} + ${hi * (lo / 2)}.`;
+    return `${hi} x ${lo} is ${hi} x ${lo - 1} plus one more ${hi}: ${hi * (lo - 1)} + ${hi}.`;
+  }
+  if (op === '/') return `Ask: ${b} times WHAT makes ${a}?`;
+  if (op === '+' && (a % 10) + (b % 10) >= 10) return `Make a ten first: ${a} + ${10 - (a % 10)} = ${a + (10 - (a % 10))}, then add the rest.`;
+  if (op === '-') return `Count up from ${b} to ${a}, or take away the tens first.`;
+  return null;
+}
+
+function submitStrike() {
+  if (app.dataset.busy) return;
+  const expr = selectedExpression();
+  if (!expr || !battle.typed) return;
+  const { a, op, b, result } = expr;
+  const ms = battle.exprReadyAt ? Math.round(performance.now() - battle.exprReadyAt) : 8000;
+  const given = parseInt(battle.typed, 10);
+  const correct = given === result;
+
+  const skill = classify(a, op, b);
+  recordAttempt(profile.mastery, { skill, fact: factKey(a, op, b), correct, ms });
+  const day = store.todayEntry(profile);
+  if (correct) { day.correct += 1; run.stats.correct += 1; } else { day.wrong += 1; run.stats.wrong += 1; }
+
+  const e = battle.enemy, p = run.player;
+  const clearSelection = () => { battle.sel = { aIdx: null, op: null, bIdx: null }; battle.typed = ''; battle.exprReadyAt = null; };
+
+  if (!correct) {
+    if (battle.mercyLeft > 0) {
+      battle.mercyLeft -= 1;
+      battle.log.push(`\u{1F54A}\uFE0F Mercy Rune: ${a} ${RUNES[op].glyph} ${b} = <b>${result}</b>, not ${given}. This one is free.`);
+      sfx.wrong();
+      clearSelection();
+      tally(false);
+      persist(); renderBattle(); return;
+    }
+    const tip = hintFor(a, op, b);
+    battle.log.push(`\u274C ${a} ${RUNES[op].glyph} ${b} = <b>${result}</b>, not ${given}.${tip ? ' ' + tip : ''}`);
+    p.combo = 0;
+    clearSelection();
+    tally(false);
+    persist();
+    return finishPlayerTurn([{ type: 'whiff', value: given, move: MOVE[op] }]);
+  }
+
+  /* Correct. Work out what the number actually did. */
+  const boost = spendBoost(p);
+  const { damage, warded, resisted, capped } = computeDamage({
+    result, op, ward: e.ward, resist: boost.pierce ? 'none' : e.resist, resistAt: e.resistAt,
+    armor: boost.pierce ? 0 : e.armor, relics: p.relics, combo: p.combo, ms, isFirstHit: battle.firstHit,
+    // An evolved fighter hits a little harder, on top of the type matchup and any move boost.
+    typeMult: typeMult(battle.fighter.type, e.type) * form(battle.fighter).power * boost.mult,
+  });
+
+  let beat;
+  if (e.shield > 0) {
+    if (result === e.shield) {
+      e.shield = 0; battle.shieldTurns = 0;
+      e.hp -= damage;
+      battle.log.push(`\u{1F4A5} EXACT ${result}! The shield shatters and you hit for <b>${damage}</b>.`);
+      beat = { type: 'strike', kind: 'shatter', value: result, dmg: damage, hp: e.hp, max: e.maxHp, move: MOVE[op] };
+    } else {
+      battle.log.push(`\u{1F6E1}\uFE0F The ${e.shield} shield swallows your ${result}. You need exactly ${e.shield}.`);
+      beat = { type: 'strike', kind: 'absorbed', value: result, dmg: 0, shield: e.shield, move: MOVE[op] };
+    }
+  } else {
+    e.hp -= damage;
+    const note = capped ? ' (capped)' : resisted ? ' (resisted)' : '';
+    battle.log.push(`${warded ? '\u{1F52E} WARD BROKEN! ' : '\u2694\uFE0F '}${a} ${RUNES[op].glyph} ${b} = ${result} \u2192 <b>${damage}</b> damage${note}.${effNote(battle.fighter.type, e.type)}`);
+    beat = { type: 'strike', kind: warded ? 'warded' : '', value: result, dmg: damage, hp: e.hp, max: e.maxHp, move: MOVE[op] };
+  }
+
+  p.combo += 1;
+  tally(true, ms);
+  battle.firstHit = false;
+  const used = [battle.sel.aIdx, battle.sel.bIdx];
+  clearSelection();
+  replaceTiles(used);
+  persist();
+  finishPlayerTurn([beat]);
+}
+
+/* Keep score for this fight alone, for the recap on the win screen. Called
+   after the combo has been updated for the answer. */
+function tally(correct, ms) {
+  const st = battle.stats;
+  if (correct) { st.right += 1; if (st.fastMs === null || ms < st.fastMs) st.fastMs = ms; }
+  else st.wrong += 1;
+  st.best = Math.max(st.best, run.player.combo);
+  // Lifetime counts the trophies are built on.
+  const r = profile.records;
+  r.bestStreak = Math.max(r.bestStreak || 0, run.player.combo);
+  if (correct && ms < 3000) r.fastAnswers = (r.fastAnswers || 0) + 1;
+  // Every right answer helps whoever is fighting evolve, and charges a move.
+  if (correct) {
+    addXp(profile, battle.fighter.id);
+    run.player.energy = Math.min(ENERGY_MAX, (run.player.energy || 0) + 1);
+  }
+}
+
+/* Roll to catch the monster just beaten. The chance is the fight's maths.
+   Returns null when there is nothing to catch (already in the book). */
+function tryCatch(e, st) {
+  if (battle.reward.trainer) return { trainer: true };
+  const mon = MONSTER_BY_ID[e.id];
+  profile.caught = profile.caught || [];
+  if (!mon) return null;
+  if (profile.caught.includes(e.id)) return { mon, already: true };
+  const chance = catchChance(st, { boss: e.boss, elite: e.elite });
+  const caught = run.rng() < chance;
+  let joined = false;
+  if (caught) {
+    profile.caught.push(e.id);
+    const ids = teamOf(profile).map(c => c.id);
+    if (ids.length < TEAM_SIZE) { profile.party = [...ids, e.id]; joined = true; }
+  }
+  return { mon, chance, caught, joined };
+}
+
+function catchLine(c) {
+  if (!c) return '';
+  if (c.trainer) return '<p class="catch-line muted">A trainer\'s monsters can\'t be caught. Catch your own in the tall grass!</p>';
+  const t = TYPES[c.mon.type];
+  if (c.already) return `<p class="catch-line muted">${c.mon.art} ${esc(c.mon.name)} is already in your Monster Book.</p>`;
+  if (c.caught) return `<p class="catch-line caught">\u{1F389} Gotcha! <b>${esc(c.mon.name)}</b> (${t.icon} ${t.name}) is yours!${c.joined ? ' It joined your team.' : ' Add it to your team at camp.'}</p>`;
+  return `<p class="catch-line escaped">It got away. Catch chance was ${Math.round(c.chance * 100)}%. Fewer mistakes and quicker answers raise it.</p>`;
+}
+
+function trophyLines(list) {
+  return list.map(t => `<p class="trophy-line">\u{1F3C6} New trophy: <b>${t.icon} ${esc(t.name)}</b> <small>${esc(t.text)}</small></p>`).join('');
+}
+
+/* After the player's move: if the enemy survived it strikes back, then the
+   whole exchange plays out and the next turn begins. */
+function finishPlayerTurn(beats) {
+  const e = battle.enemy, p = run.player;
+  if (e.hp <= 0) {
+    beats.push({ type: 'faint', who: 'foe' });
+    return playFx(beats, nextTurn);
+  }
+  beats.push(...enemyAction());
+  endEnemyPhase();
+  if (p.hp <= 0) beats.push({ type: 'faint', who: 'hero' });
+  persist();
+  playFx(beats, nextTurn);
+}
+
+/* The enemy's telegraphed move actually happening. Skipped entirely when the
+   player parries it on a drill turn. */
+function enemyAction() {
+  const e = battle.enemy, p = run.player;
+  const { intent, events } = enemyAct(e, p, run.rng);
+  const beats = [];
+  for (const ev of events) {
+    battle.log.push(ev.text);
+    if (ev.type === 'damage') beats.push({ type: 'foeAttack', dmg: ev.amount, hp: p.hp, max: p.maxHp, big: intent.type === 'bigAttack' });
+    if (ev.type === 'jam') { battle.pendingJam = true; beats.push({ type: 'foeBuff', kind: 'jam', text: ev.text }); }
+    if (ev.type === 'shield') { battle.shieldTurns = 3; beats.push({ type: 'foeBuff', kind: 'shield', text: ev.text }); }
+    if (ev.type === 'armor') beats.push({ type: 'foeBuff', kind: 'armor', text: ev.text });
+    if (ev.type === 'heal') beats.push({ type: 'foeBuff', kind: 'heal', text: ev.text, amount: intent.amount, hp: e.hp, max: e.maxHp });
+    if (ev.type === 'skip') beats.push({ type: 'foeBuff', kind: 'skip', text: ev.text });
+    if (ev.type === 'blocked') beats.push({ type: 'parry', leak: 0 });
+  }
+  return beats;
+}
+
+/* Timers and locks tick down whether or not the move landed, so a parry does
+   not freeze a shield in place forever. */
+function endEnemyPhase() {
+  const e = battle.enemy;
+  if (e.shield > 0) {
+    battle.shieldTurns -= 1;
+    if (battle.shieldTurns <= 0) { e.shield = 0; battle.log.push('The shield flickers out.'); }
+  }
+  battle.lockedId = null;
+  if (battle.pendingJam) {
+    const free = battle.tiles.filter(Boolean);
+    if (free.length) battle.lockedId = free[Math.floor(run.rng() * free.length)].id;
+    battle.pendingJam = false;
+  }
+}
+
+/* Turns alternate: the player builds their own strike, then the game hands
+   them one. Building is where the thinking is; the drill is the only place
+   the game can insist on a fact they would otherwise never choose. */
+function drillsOn() {
+  return profile.prefs ? profile.prefs.drills !== false : true;
+}
+
+function nextTurn() {
+  if (run.player.hp <= 0) return loseRun();
+  if (battle.enemy.hp <= 0) return winBattle();
+  battle.turn += 1;
+  if (battle.allDrills || (drillsOn() && battle.turn % 2 === 0)) return beginDrill();
+  battle.mode = 'build';
+  renderBattle();
+}
+
+/* ========================================================= drill turns === */
+/* Share of a hit that still lands on a clean parry. Applies to every drill
+   parry, not just duels: parrying is what a fluent player does on half of all
+   turns, so a free parry removes most of the run's danger for them alone.
+   A kid who misses takes the full hit either way, so this raises the ceiling
+   without touching the floor. */
+const PARRY_LEAK = 0.4;
+
+let drillTimer = null;
+
+function stopDrillTimer() {
+  if (drillTimer) { clearInterval(drillTimer); drillTimer = null; }
+}
+
+function beginDrill() {
+  const level = difficultyLevel(profile.mastery, profile.grade);
+  const d = pickDrill(run.rng, profile.mastery, run.player.runes, level);
+  if (!d) { battle.mode = 'build'; return renderBattle(); } // nothing to drill yet
+  battle.mode = 'drill';
+  /* The answer comes from the picker. Recomputing it here used to overwrite a
+     written problem's answer with evaluate(undefined, undefined, undefined),
+     which is NaN, so nothing the player typed could ever be right. */
+  battle.drill = d;
+  battle.allowanceMs = drillAllowanceMs(profile.mastery, d);
+  battle.drillStart = performance.now();
+  battle.typed = '';
+  renderDrill();
+}
+
+/* Running the duel clock out does not end the run. The boss simply starts
+   hitting twice as hard, so a slow fight gets dangerous rather than lost. */
+function checkEnrage() {
+  if (!battle.fightMs || battle.enemy.enraged) return false;
+  if (performance.now() - battle.fightStart < battle.fightMs) return false;
+  battle.enemy.enraged = true;
+  battle.log.push(`\u{1F525} The duel has run long. ${esc(battle.enemy.name)} is ENRAGED and hits twice as hard.`);
+  return true;
+}
+
+function fightTimerHtml() {
+  if (!battle.fightMs) return '';
+  const left = Math.max(0, battle.fightMs - (performance.now() - battle.fightStart));
+  const pct = Math.max(0, left / battle.fightMs * 100);
+  const enraged = battle.enemy.enraged;
+  return `
+    <div class="fight-timer ${enraged ? 'enraged' : ''}" id="fighttimer">
+      <span style="width:${pct}%"></span>
+      <b>${enraged ? '\u{1F525} ENRAGED' : `Duel clock ${Math.ceil(left / 1000)}s`}</b>
+    </div>`;
+}
+
+function renderDrill() {
+  const d = battle.drill, p = run.player;
+  const intent = describeIntent(battle.enemy);
+  render(`
+    <div class="screen battle drill">
+      ${topBar({ inBattle: true })}
+      ${fieldHtml()}
+
+      ${logRow()}
+
+      ${battle.allDrills ? '<div class="duel-banner">\u2694\uFE0F BOSS DUEL</div>' : ''}
+      ${fightTimerHtml()}
+
+      <div class="incoming">\u26A1 INCOMING: ${intent.text}. Answer to parry it.</div>
+
+      <div class="drill-group">
+        <div class="timer" id="timerbar"><span style="width:100%"></span></div>
+        ${d.kind === 'text' ? `
+          <p class="asked">${esc(d.prompt)}</p>
+          <div class="drill-problem">
+            <span class="answer ${battle.typed ? 'filled' : ''}">${battle.typed || '_'}</span>
+          </div>` : `
+          <div class="drill-problem">
+            <span class="dp">${d.a}</span>
+            <span class="dp op">${RUNES[d.op].glyph}</span>
+            <span class="dp">${d.b}</span>
+            <span class="eq">=</span>
+            <span class="answer ${battle.typed ? 'filled' : ''}">${battle.typed || '_'}</span>
+          </div>`}
+      </div>
+
+      ${keypadHtml({ submitId: 'answer', submitLabel: 'PARRY', ready: !!battle.typed, extras: d.kind === 'text' })}
+
+    </div>`);
+
+  $$('.key').forEach(b => b.onclick = () => {
+    battle.typed = typeInto(battle.typed, b.dataset.k);
+    sfx.tap();
+    renderDrill();
+  });
+  const go = $('#answer');
+  if (go) go.onclick = () => resolveDrill(battle.typed);
+  wireTeam();
+  wireMoves();
+
+  startDrillTimer();
+}
+
+function startDrillTimer() {
+  stopDrillTimer();
+  drillTimer = setInterval(() => {
+    if (!battle || battle.mode !== 'drill') return stopDrillTimer();
+    const bar = app.querySelector('#timerbar span');
+    if (!bar) return stopDrillTimer();
+    const left = battle.allowanceMs - (performance.now() - battle.drillStart);
+    const pct = Math.max(0, left / battle.allowanceMs * 100);
+    bar.style.width = `${pct}%`;
+    bar.classList.toggle('low', pct < 33);
+
+    if (battle.fightMs) {
+      const wasEnraged = battle.enemy.enraged;
+      checkEnrage();
+      const box = app.querySelector('#fighttimer');
+      if (box) {
+        const dleft = Math.max(0, battle.fightMs - (performance.now() - battle.fightStart));
+        box.querySelector('span').style.width = `${dleft / battle.fightMs * 100}%`;
+        if (battle.enemy.enraged) {
+          box.classList.add('enraged');
+          box.querySelector('b').textContent = '\u{1F525} ENRAGED';
+        } else if (!wasEnraged) {
+          box.querySelector('b').textContent = `Duel clock ${Math.ceil(dleft / 1000)}s`;
+        }
+      }
+    }
+
+    if (left <= 0) { stopDrillTimer(); resolveDrill(null); }
+  }, 80);
+}
+
+function resolveDrill(text) {
+  if (app.dataset.busy) return;
+  stopDrillTimer();
+  const d = battle.drill, e = battle.enemy, p = run.player;
+  const ms = Math.round(performance.now() - battle.drillStart);
+  const timedOut = text === null;
+  const { ok: correct, note } = timedOut ? { ok: false, note: null } : checkAnswer(text, d.answer);
+  const shown = d.kind === 'text' ? d.prompt : `${d.a} ${RUNES[d.op].glyph} ${d.b}`;
+  const expected = formatAnswer(d.answer);
+
+  recordAttempt(profile.mastery, { skill: d.skill, fact: d.fact, correct, ms });
+  const day = store.todayEntry(profile);
+  if (correct) { day.correct += 1; run.stats.correct += 1; } else { day.wrong += 1; run.stats.wrong += 1; }
+
+  // Mercy still means "free", so it parries without the counter.
+  const mercied = !correct && battle.mercyLeft > 0;
+  if (mercied) battle.mercyLeft -= 1;
+  checkEnrage();
+  const move = d.kind === 'text' ? 'Scholar Strike' : MOVE[d.op];
+  const beats = [];
+
+  if (correct) {
+    /* A parry blunts the blow rather than stopping it outright. */
+    const pending = e.intents[e.intentIndex % e.intents.length];
+    if (pending.dmg) {
+      const block = p.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+        .reduce((sum, r) => sum + (r.block || 0), 0);
+      const raw = Math.round((e.enraged ? pending.dmg * 2 : pending.dmg) * (e.typeEdge || 1) * (e.weak ? e.weak.mult : 1));
+      if (p.guard) {
+        p.guard = false;
+        battle.log.push('Your shield takes the whole blow.');
+        beats.push({ type: 'parry', leak: 0 });
+      } else {
+        const leak = Math.max(1, Math.round(raw * PARRY_LEAK) - block);
+        p.hp -= leak;
+        battle.log.push(`You turn the blow aside, but ${leak} still gets through.`);
+        beats.push({ type: 'parry', leak, hp: p.hp, max: p.maxHp });
+      }
+    } else {
+      beats.push({ type: 'parry', leak: 0 });
+    }
+    e.intentIndex += 1; // the telegraphed move never happens
+
+    /* A written answer can be a fraction, a decimal or a negative, none of
+       which make sense as a damage number, so a written problem counters for
+       what an average drill answer is worth in this fight. A calculation
+       counters for its own result, as before.
+
+       Either way the counter gets no ward or resist bonus: the player did not
+       choose the number, so the reward is for speed and accuracy and the built
+       turn keeps the high ceiling. A riposte also ignores shields, so a
+       shielded enemy cannot make drills a dead turn. */
+    const result = d.kind === 'text' ? battle.askedDamage : d.answer;
+    const boost = spendBoost(p);
+    const { damage } = computeDamage({
+      result, op: d.op || '+', ward: 'none', resist: 'none', resistAt: 0,
+      armor: boost.pierce ? 0 : e.armor, relics: p.relics, combo: p.combo, ms, isFirstHit: false,
+      typeMult: typeMult(battle.fighter.type, e.type) * form(battle.fighter).power * boost.mult,
+    });
+    e.hp -= damage;
+    p.combo += 1;
+    battle.log.push(d.kind === 'text'
+      ? `\u{1F6E1}\uFE0F PARRIED! ${expected} is right, riposte for <b>${damage}</b>.${effNote(battle.fighter.type, e.type)}${note ? ' ' + note : ''}`
+      : `\u{1F6E1}\uFE0F PARRIED! ${shown} = ${expected}, riposte for <b>${damage}</b>.${effNote(battle.fighter.type, e.type)}`);
+    beats.push({ type: 'strike', kind: '', value: expected, dmg: damage, hp: e.hp, max: e.maxHp, move });
+  } else if (mercied) {
+    e.intentIndex += 1;
+    battle.log.push(`\u{1F54A}\uFE0F Mercy Rune parries it. The answer was <b>${expected}</b>.`);
+    beats.push({ type: 'parry', leak: 0 });
+  } else {
+    const tip = d.kind === 'arith' ? hintFor(d.a, d.op, d.b) : null;
+    battle.log.push(timedOut
+      ? `\u23F1\uFE0F Too slow. The answer was <b>${expected}</b>.${tip ? ' ' + tip : ''}`
+      : `\u274C The answer was <b>${expected}</b>, not ${esc(text)}.${tip ? ' ' + tip : ''}`);
+    p.combo = 0;
+    beats.push({ type: 'whiff', value: timedOut ? '...' : text, move });
+    if (e.hp > 0) beats.push(...enemyAction());
+  }
+
+  tally(correct, ms);
+  endEnemyPhase();
+  // Same order nextTurn checks in, so the picture matches what happens next.
+  if (p.hp <= 0) beats.push({ type: 'faint', who: 'hero' });
+  else if (e.hp <= 0) beats.push({ type: 'faint', who: 'foe' });
+  persist();
+  playFx(beats, nextTurn);
+}
+
+function winBattle() {
+  const p = run.player, e = battle.enemy;
+  // A trainer with another monster left sends it out: no rewards until the last.
+  const tr = battle.reward.trainer;
+  if (tr && tr.queue.length) return trainerNext();
+  const goldBonus = p.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+    .reduce((s, r) => s + (r.goldBonus || 0), 0);
+  const gold = (battle.reward.gold || 0) + goldBonus;
+  p.gold += gold;
+  const healAfter = p.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+    .reduce((s, r) => s + (r.healAfter || 0), 0);
+  if (healAfter) p.hp = Math.min(p.maxHp, p.hp + healAfter);
+  run.stats.battlesWon += 1;
+  let unlockMsg = '';
+  if (e.boss) { profile.records.bossesFelled += 1; unlockMsg = grantBossUnlock(); }
+  const st = battle.stats;
+  const r = profile.records;
+  r.fightsWon = (r.fightsWon || 0) + 1;
+  if (st.wrong === 0 && st.right >= 5) r.flawlessFights = (r.flawlessFights || 0) + 1;
+  if (e.boss && st.wrong === 0 && st.right >= 1) r.flawlessBosses = (r.flawlessBosses || 0) + 1;
+  const caught = tryCatch(e, st);
+  const trophies = checkTrophies(profile, difficultyLevel(profile.mastery, profile.grade));
+  const levelUp = levelUpLine();
+  if (run.area && !e.boss) run.area.wins += 1;
+  const questDone = questProgress({
+    wild: !!battle.reward.wild, caught: !!(caught && caught.caught), flawless: st.wrong === 0 && st.right >= 3,
+    superEff: typeMult(battle.fighter.type, e.type) > 1, best: st.best,
+  });
+  persist();
+  sfx.win();
+
+  const recap = [
+    `<b>${st.right}</b> right`,
+    `<b>${st.wrong}</b> wrong`,
+    st.best >= 2 ? `best streak <b>${st.best}</b>` : '',
+    st.fastMs !== null ? `fastest <b>${(st.fastMs / 1000).toFixed(1)}s</b>` : '',
+  ].filter(Boolean).map(x => `<span>${x}</span>`).join(' &middot; ');
+  const boss = !!e.boss;
+  const confetti = boss ? Array.from({ length: 26 }, (_, i) =>
+    `<i style="left:${(i * 37) % 100}%;--d:${((i * 7) % 10) / 10}s;--c:${CONFETTI[i % CONFETTI.length]};--x:${((i * 53) % 60) - 30}px"></i>`).join('') : '';
+
+  render(`
+    <div class="screen center win-scene ${boss ? 'boss' : ''} ${caught && caught.mon && !caught.already ? (caught.caught ? 'catching caught' : 'catching escaped') : ''}">
+      ${topBar()}
+      <div class="stage ${boss ? 'boss' : ''}">
+        ${boss ? `<div class="rays"></div><div class="confetti">${confetti}</div>` : ''}
+        <div class="vbanner">${boss ? 'BOSS FELLED!' : 'VICTORY!'}</div>
+        <div class="vplat"></div>
+        <div class="vhero">${boss ? '<span class="crown">\u{1F451}</span>' : ''}${charSpan(form(battle.fighter))}</div>
+        <div class="vfoe">${e.art}</div>
+        <div class="dizzy">\u{1F4AB}</div>
+        ${caught && caught.mon && !caught.already ? '<div class="vorb">\u{1F52E}</div>' : ''}
+      </div>
+      <div class="panel win vpanel">
+        <p class="vline">${esc(form(battle.fighter).name)} beat ${esc(e.name)}!</p>
+        <p class="recap">${recap}</p>
+        ${catchLine(caught)}
+        <p class="reward">\u{1FA99} +${gold} gold${healAfter ? ` &middot; \u2764\uFE0F +${healAfter}` : ''}</p>
+        ${unlockMsg ? `<p class="unlock">${unlockMsg}</p>` : ''}
+        ${questDone}
+        ${levelUp}
+        ${trophyLines(trophies)}
+        <button class="btn primary" id="cont">Continue</button>
+      </div>
+    </div>`);
+
+  /* The scene plays for a moment, then waits for Continue. A tap before it
+     finishes only skips to the end, so a kid still tapping through the
+     knockout does not fly past the rewards. */
+  const scene = $('.win-scene');
+  const finishScene = () => scene.classList.add('done');
+  if (reducedMotion()) finishScene();
+  else {
+    const gen = fxGen;
+    const catching = caught && caught.mon && !caught.already;
+    setTimeout(() => { if (gen === fxGen) finishScene(); }, (boss ? 1900 : 1500) + (catching ? 900 : 0));
+    if (catching) setTimeout(() => { if (gen === fxGen) (caught.caught ? sfx.reward : sfx.wrong)(); }, 1500);
+  }
+  scene.addEventListener('click', finishScene);
+  $('#cont').onclick = () => {
+    if (!scene.classList.contains('done')) return finishScene();
+    sfx.tap();
+    withEvolutions(() => {
+      if (e.boss && !run.endless && run.depth >= FINAL_DEPTH) return screenRunComplete();
+      // The boss tower is the way off a boss floor; everything else is back to the world.
+      const after = e.boss ? nextFloor : leaveNode;
+      if (battle.reward.relic) return screenRelicPick(() => after());
+      after();
+    });
+  };
+}
+
+/* ============================================================== versus === */
+/* Two heroes on one device, taking turns. Each answers a problem at THEIR
+   OWN level, on a clock set from their own speed, so brothers years apart
+   battle evenly: neither ever sees the other's problems. A right answer
+   attacks the other's team (types, evolution and moves all count, and a
+   quicker answer hits harder); a wrong one misses and shows the answer.
+   A cover screen hides everything while the device is passed. Answers go on
+   each kid's own report card, right answers help their own characters
+   evolve, and the winner gets a trophy and gold for their next run. Nothing
+   is taken from the loser. */
+const VS_HP = 80;
+const VS_BASE = 10;
+const VS_PRIZE_GOLD = 15;
+let vs = null;
+
+function vsPlayer(prof) {
+  const team = teamOf(prof);
+  return { prof, team, fighter: team[0], hp: VS_HP, maxHp: VS_HP, energy: 0,
+           guard: false, boost: null, skipNext: false, weak: null, right: 0, wrong: 0 };
+}
+
+function screenVersusPick() {
+  const others = data.profiles.filter(p => p.id !== profile.id);
+  render(`
+    <div class="screen center">
+      <div class="panel">
+        <h2>⚔️ Battle a friend</h2>
+        <p class="muted center">${esc(profile.name)}'s team against another hero on this device. You take turns, and each of you gets problems at your own level, so it's a fair fight.</p>
+        <div class="profile-list">
+          ${others.map(o => `<button class="profile-card" data-vs="${o.id}">
+            <span class="pa">${formOf(o, teamOf(o)[0]).char}</span>
+            <span class="pn">${esc(o.name)}</span>
+            <span class="pd">${teamOf(o).map(c => formOf(o, c).char).join(' ')}</span>
+          </button>`).join('')}
+        </div>
+        <button class="btn ghost" id="back">Back</button>
+      </div>
+    </div>`);
+  $$('[data-vs]').forEach(b => b.onclick = () => {
+    sfx.tap();
+    const other = data.profiles.find(p => p.id === b.dataset.vs);
+    vs = { p: [vsPlayer(profile), vsPlayer(other)], turn: Math.random() < 0.5 ? 0 : 1,
+           rng: makeRng(Date.now() % 2147483647), log: [] };
+    vsCover();
+  });
+  $('#back').onclick = () => { sfx.tap(); screenHub(); };
+}
+
+const vsMe = () => vs.p[vs.turn];
+const vsOpp = () => vs.p[1 - vs.turn];
+
+/* Between turns: nothing on screen but whose turn it is. */
+function vsCover() {
+  const me = vsMe();
+  const f = formOf(me.prof, me.fighter);
+  render(`
+    <div class="screen center vs-cover">
+      <div class="panel">
+        <p class="muted center">Pass the device to</p>
+        <h2 class="center">${esc(me.prof.name)}</h2>
+        <div class="big-art huge">${f.char}</div>
+        <div class="vs-score">${vs.p.map(x => `<span>${esc(x.prof.name)} <b>❤️ ${Math.max(0, x.hp)}</b></span>`).join('<i>vs</i>')}</div>
+        ${vs.log.length ? `<p class="center muted vs-last">${vs.log[vs.log.length - 1]}</p>` : ''}
+        <button class="btn primary big" id="vsReady">I'm ready!</button>
+      </div>
+    </div>`);
+  $('#vsReady').onclick = () => { sfx.tap(); vsTurn(); };
+}
+
+function vsTurn() {
+  const me = vsMe();
+  const level = difficultyLevel(me.prof.mastery, me.prof.grade);
+  const runes = unlockedOps(me.prof.mastery, me.prof.grade);
+  const d = pickDrill(vs.rng, me.prof.mastery, runes, level)
+    || { kind: 'arith', a: 3, op: '+', b: 4, answer: 7, skill: 'add_small', fact: factKey(3, '+', 4) };
+  vs.drill = d;
+  vs.allowance = drillAllowanceMs(me.prof.mastery, d);
+  vs.start = performance.now();
+  vs.typed = '';
+  renderVs();
+}
+
+function renderVs() {
+  const me = vsMe(), opp = vsOpp(), d = vs.drill;
+  const mf = formOf(me.prof, me.fighter), of = formOf(opp.prof, opp.fighter);
+  const known = movesOf(me.prof, me.fighter);
+  const ready = known.some(m => m.cost <= me.energy);
+  render(`
+    <div class="screen battle drill vs-screen">
+      <div class="topbar"><span>⚔️ ${esc(me.prof.name)}'s turn</span>
+        ${me.team.length > 1 ? `<span class="team-chips">${me.team.map(c => `<button class="tchip ${c.id === me.fighter.id ? 'on' : ''} ${matchup(c.type, opp.fighter.type).edge}" data-vsf="${c.id}">
+          <span class="tc">${formOf(me.prof, c).char}</span><span class="tt">${TYPES[c.type].icon}</span></button>`).join('')}</span>` : ''}</div>
+      <div class="field">
+        <div class="ibox foe">
+          <div class="nm"><span>${TYPES[opp.fighter.type].icon} ${esc(opp.prof.name)}: ${esc(of.name)}</span></div>
+          ${hpBar('foeHp', opp.hp, opp.maxHp)}
+          <div class="intent">${opp.guard ? '\u{1F6E1}️ Shielded' : opp.skipNext ? '\u{1F33F} Tangled' : `⚡ ${opp.energy} energy`}</div>
+        </div>
+        <div class="plat foe"></div>
+        <div class="sprite foe evo${of.stage} t-${of.type}" id="foeSprite">${of.char}</div>
+        <div class="plat hero"></div>
+        <div class="sprite hero evo${mf.stage} t-${mf.type}" id="heroSprite">${mf.char}</div>
+        <div class="ibox hero">
+          <div class="nm"><span>${TYPES[me.fighter.type].icon} ${esc(me.prof.name)}: ${esc(mf.name)}${stars(mf.stage)}</span></div>
+          ${hpBar('heroHp', me.hp, me.maxHp)}
+        </div>
+      </div>
+      <div class="log-row"><div class="log"><div>${matchupLine(me, opp)}</div><div>Answer right to attack. Faster hits harder!</div></div>
+        <button class="moves-btn ${ready ? 'ready' : ''}" id="movesBtn"><span>✨</span><b>${me.energy}</b><small>⚡ energy</small></button></div>
+      <div class="drill-group">
+        <div class="timer" id="timerbar"><span style="width:100%"></span></div>
+        ${d.kind === 'text' ? `
+          <p class="asked">${esc(d.prompt)}</p>
+          <div class="drill-problem"><span class="answer ${vs.typed ? 'filled' : ''}">${vs.typed || '_'}</span></div>` : `
+          <div class="drill-problem">
+            <span class="dp">${d.a}</span><span class="dp op">${RUNES[d.op].glyph}</span><span class="dp">${d.b}</span>
+            <span class="eq">=</span><span class="answer ${vs.typed ? 'filled' : ''}">${vs.typed || '_'}</span>
+          </div>`}
+      </div>
+      ${keypadHtml({ submitId: 'vsGo', submitLabel: 'ATTACK', ready: !!vs.typed, extras: d.kind === 'text' })}
+    </div>`);
+  $$('.key').forEach(b => b.onclick = () => { vs.typed = typeInto(vs.typed, b.dataset.k); sfx.tap(); renderVs(); });
+  $('#vsGo').onclick = () => vsAnswer(vs.typed);
+  $$('[data-vsf]').forEach(b => b.onclick = () => {
+    const c = me.team.find(x => x.id === b.dataset.vsf);
+    if (c && c.id !== me.fighter.id) { me.fighter = c; sfx.tap(); renderVs(); }
+  });
+  $('#movesBtn').onclick = ev => {
+    ev.stopPropagation();
+    openMoves({ name: mf.name, type: me.fighter.type, known: known.length, energy: me.energy, onUse: vsUseMove });
+  };
+  stopDrillTimer();
+  drillTimer = setInterval(() => {
+    const bar = app.querySelector('#timerbar span');
+    if (!bar || !vs) return stopDrillTimer();
+    const left = vs.allowance - (performance.now() - vs.start);
+    const pct = Math.max(0, left / vs.allowance * 100);
+    bar.style.width = `${pct}%`;
+    bar.classList.toggle('low', pct < 33);
+    if (left <= 0) { stopDrillTimer(); vsAnswer(null); }
+  }, 80);
+}
+
+function matchupLine(me, opp) {
+  const m = matchup(me.fighter.type, opp.fighter.type);
+  const t = TYPES[me.fighter.type], o = TYPES[opp.fighter.type];
+  return m.edge === 'strong' ? `<b class="good">${t.icon} beats ${o.icon}: super effective!</b>`
+    : m.edge === 'clash' ? `<b>${t.icon} vs ${o.icon}: super effective both ways!</b>`
+    : m.edge === 'weak' || m.edge === 'risky' ? `<b class="bad">${o.icon} ${o.name} is strong against you.</b> Switch?`
+    : `${t.icon} vs ${o.icon}: an even match.`;
+}
+
+function vsUseMove(mv) {
+  const me = vsMe(), opp = vsOpp();
+  if (me.energy < mv.cost) return;
+  closeMoves();
+  me.energy -= mv.cost;
+  const out = applyMove(mv, me, opp, me.fighter.type, opp.fighter.type);
+  vs.log.push(`✨ ${esc(me.prof.name)} used <b>${mv.name}</b>!${out.dmg ? ` ${out.dmg} damage.` : ''}${out.heal ? ` Healed ${out.heal}.` : ''}`);
+  sfx.crit();
+  if (out.dmg) { shake($('#foeSprite'), true); popNumber($('#foeSprite'), `-${out.dmg}`, 'crit'); setBar('foeHp', opp.hp, opp.maxHp); }
+  if (out.heal) { popNumber($('#heroSprite'), `+${out.heal}`, 'heal'); setBar('heroHp', me.hp, me.maxHp); }
+  if (opp.hp <= 0) { stopDrillTimer(); return setTimeout(() => vsWin(me, opp), reducedMotion() ? 0 : 700); }
+  // Redraw the move button and status without restarting the clock.
+  const btn = $('#movesBtn');
+  if (btn) btn.querySelector('b').textContent = me.energy;
+  btn?.classList.toggle('ready', movesOf(me.prof, me.fighter).some(m => m.cost <= me.energy));
+  const st = $('.ibox.foe .intent');
+  if (st) st.textContent = opp.guard ? '\u{1F6E1}️ Shielded' : opp.skipNext ? '\u{1F33F} Tangled' : `⚡ ${opp.energy} energy`;
+  const log = $('.log');
+  if (log) log.innerHTML = `<div>${vs.log[vs.log.length - 1]}</div><div>Now answer to attack!</div>`;
+}
+
+function vsAnswer(text) {
+  if (app.dataset.busy) return;
+  stopDrillTimer();
+  const me = vsMe(), opp = vsOpp(), d = vs.drill;
+  const ms = Math.round(performance.now() - vs.start);
+  const correct = text !== null && checkAnswer(text, d.answer).ok;
+  recordAttempt(me.prof.mastery, { skill: d.skill, fact: d.fact, correct, ms });
+  const day = store.todayEntry(me.prof);
+  if (correct) day.correct += 1; else day.wrong += 1;
+  const shown = formatAnswer(d.answer);
+  let dmg = 0, line;
+  if (correct) {
+    me.right += 1;
+    me.energy = Math.min(ENERGY_MAX, me.energy + 1);
+    addXp(me.prof, me.fighter.id);
+    const boost = spendBoost(me);
+    const speed = 1 + 0.5 * Math.max(0, 1 - ms / vs.allowance);
+    let weak = 1;
+    if (me.weak) { weak = me.weak.mult; me.weak.hits -= 1; if (me.weak.hits <= 0) me.weak = null; }
+    dmg = Math.max(1, Math.round(VS_BASE * typeMult(me.fighter.type, opp.fighter.type)
+      * formOf(me.prof, me.fighter).power * boost.mult * speed * weak));
+    if (opp.guard) { opp.guard = false; dmg = 0; line = `${esc(opp.prof.name)}'s shield blocked ${esc(me.prof.name)}'s attack!`; }
+    else if (me.skipNext) { me.skipNext = false; dmg = 0; line = `${esc(me.prof.name)} was tangled and the attack missed!`; }
+    else line = `${esc(me.prof.name)} got it right and hit for <b>${dmg}</b>!${effNote(me.fighter.type, opp.fighter.type)}`;
+    opp.hp -= dmg;
+  } else {
+    me.wrong += 1;
+    line = text === null ? `${esc(me.prof.name)} ran out of time. The answer was <b>${shown}</b>.`
+                         : `${esc(me.prof.name)} missed! The answer was <b>${shown}</b>.`;
+  }
+  vs.log.push(line);
+  persist();
+  const foe = $('#foeSprite');
+  const log = $('.log');
+  if (log) log.innerHTML = `<div>${line}</div>`;
+  if (dmg) { shake(foe, true); popNumber(foe, `-${dmg}`, 'hit'); setBar('foeHp', opp.hp, opp.maxHp); sfx.hit(); }
+  else if (!correct) sfx.wrong(); else sfx.hurt();
+  app.dataset.busy = '1';
+  const gen = fxGen;
+  setTimeout(() => {
+    if (gen !== fxGen) return;
+    delete app.dataset.busy;
+    if (opp.hp <= 0) return vsWin(me, opp);
+    vs.turn = 1 - vs.turn;
+    vsCover();
+  }, reducedMotion() ? 0 : 1200);
+}
+
+function vsWin(winner, loser) {
+  const r = winner.prof.records;
+  r.versusWins = (r.versusWins || 0) + 1;
+  winner.prof.meta.bankGold = (winner.prof.meta.bankGold || 0) + VS_PRIZE_GOLD;
+  const trophies = checkTrophies(winner.prof, difficultyLevel(winner.prof.mastery, winner.prof.grade));
+  checkTrophies(loser.prof, difficultyLevel(loser.prof.mastery, loser.prof.grade));
+  persist();
+  sfx.win();
+  const wf = formOf(winner.prof, winner.fighter);
+  render(`
+    <div class="screen center win-scene done">
+      <div class="stage">
+        <div class="vbanner">${esc(winner.prof.name).toUpperCase()} WINS!</div>
+        <div class="vplat"></div>
+        <div class="vhero">${charSpan(wf)}</div>
+      </div>
+      <div class="panel win vpanel">
+        <ul class="run-stats">
+          ${vs.p.map(x => `<li><b>${esc(x.prof.name)}</b>: ${x.right} right &middot; ${x.wrong} wrong</li>`).join('')}
+        </ul>
+        <p class="reward">\u{1FA99} ${esc(winner.prof.name)} gets +${VS_PRIZE_GOLD} gold on their next run.</p>
+        ${trophyLines(trophies)}
+        <p class="muted tiny center">Every answer went on each of your report cards, and right answers helped your characters evolve.</p>
+        <div class="row">
+          <button class="btn primary" id="rematch">Rematch</button>
+          <button class="btn ghost" id="home">Back to camp</button>
+        </div>
+      </div>
+    </div>`);
+  const a = vs.p[0].prof, b = vs.p[1].prof;
+  const after = next => evolveFor(a, () => evolveFor(b, next));
+  $('#rematch').onclick = () => { sfx.tap(); after(() => { vs = { p: [vsPlayer(a), vsPlayer(b)], turn: Math.random() < 0.5 ? 0 : 1, rng: makeRng(Date.now() % 2147483647), log: [] }; vsCover(); }); };
+  $('#home').onclick = () => { sfx.tap(); after(() => { vs = null; screenHub(); }); };
+}
+
+/* Evolutions belong to whichever hero earned them, which in versus is not
+   always the one signed in. */
+function evolveFor(prof, next) {
+  const keep = profile;
+  profile = prof;
+  withEvolutions(() => { profile = keep; next(); });
+}
+
+/* ============================================================ evolving === */
+/* After a fight, anything whose right answers earned a new stage evolves, one
+   at a time, on a screen of its own, the way every kid who has played Pokemon
+   expects. The flicker between old and new speeds up, then the new form holds. */
+function withEvolutions(next) {
+  const list = pendingEvolutions(profile);
+  if (!list.length) return next();
+  screenEvolve(list[0], () => withEvolutions(next));
+}
+
+function screenEvolve(ev, done) {
+  const c = CHARACTER_BY_ID[ev.id];
+  const before = formOf(profile, c, ev.from), after = formOf(profile, c, ev.to);
+  evolve(profile, ev.id);
+  persist();
+  const boost = Math.round((after.power - 1) * 100);
+  render(`
+    <div class="screen center evolve-screen">
+      <div class="evo-stage t-${c.type}">
+        <div class="evo-rays"></div>
+        <div class="evo-pair">
+          <span class="evo-old">${before.char}</span>
+          <span class="evo-new evo${after.stage} t-${c.type}">${after.char}</span>
+        </div>
+      </div>
+      <div class="panel win">
+        <p class="evo-what">What? <b>${esc(before.name)}</b> is evolving!</p>
+        <p class="evo-done"><b>${esc(before.name)}</b> evolved into <b>${esc(after.name)}</b>! ${stars(after.stage)}</p>
+        <p class="muted center evo-done">${TYPES[c.type].icon} Hits ${boost}% harder than when it started.${after.stage < 3 ? ' One more evolution to go.' : ' Fully evolved!'}</p>
+        <p class="center evo-done evo-move">\u2728 New move learned: <b>${(MOVES[c.type] || MOVES.light)[after.stage - 1].name}</b>! <small>${(MOVES[c.type] || MOVES.light)[after.stage - 1].text}</small></p>
+        <button class="btn primary evo-done" id="evoOk">Awesome!</button>
+      </div>
+    </div>`);
+  const scene = $('.evolve-screen');
+  const finish = () => {
+    if (scene.classList.contains('done')) return;
+    scene.classList.add('done');
+    sfx.win();
+  };
+  if (reducedMotion()) finish();
+  else {
+    sfx.reward();
+    const gen = fxGen;
+    setTimeout(() => { if (gen === fxGen) finish(); }, 2600);
+  }
+  scene.addEventListener('click', finish);
+  $('#evoOk').onclick = ev2 => {
+    ev2.stopPropagation();
+    if (!scene.classList.contains('done')) return finish();
+    sfx.tap(); done();
+  };
+}
+
+/* Between a trainer's monsters: count the win, then out comes the next one.
+   Health and combo carry over; gold, the relic and the win scene wait for the last. */
+function trainerNext() {
+  const e = battle.enemy, st = battle.stats, tr = battle.reward.trainer;
+  run.stats.battlesWon += 1;
+  const r = profile.records;
+  r.fightsWon = (r.fightsWon || 0) + 1;
+  if (st.wrong === 0 && st.right >= 5) r.flawlessFights = (r.flawlessFights || 0) + 1;
+  const trophies = checkTrophies(profile, difficultyLevel(profile.mastery, profile.grade));
+  persist();
+  sfx.win();
+  const next = tr.queue[0];
+  render(`
+    <div class="screen center">
+      ${topBar()}
+      <div class="panel win trainer-next">
+        <p class="vline">${esc(e.name)} fainted!</p>
+        <div class="big-art">${tr.art}</div>
+        <p class="center"><b>${esc(tr.name)}</b>: "Not bad! But can you beat this one?"</p>
+        <p class="center">${esc(tr.name)} is about to send out <b>${esc(next.name)}</b> (${TYPES[next.type].icon} ${TYPES[next.type].name}).</p>
+        ${trophyLines(trophies)}
+        <button class="btn primary" id="cont">Bring it on!</button>
+      </div>
+    </div>`);
+  $('#cont').onclick = () => {
+    sfx.tap();
+    withEvolutions(() => startBattle(tr.queue.shift(), battle.reward));
+  };
+}
+
+/* Clearing floor 20. The one screen in the game that says "you finished". */
+function screenRunComplete() {
+  run.over = true;
+  profile.records.wins = (profile.records.wins || 0) + 1;
+  persist();
+  sfx.win();
+  const total = run.stats.correct + run.stats.wrong;
+  const acc = total ? Math.round(run.stats.correct / total * 100) : 0;
+  render(`
+    <div class="screen center">
+      <div class="panel win">
+        <h2>THE DEEP IS CLEARED</h2>
+        <div class="big-art">\u{1F3C6}</div>
+        <p class="center">You beat all 20 floors.</p>
+        <ul class="run-stats">
+          <li><b>${run.stats.battlesWon}</b> monsters beaten</li>
+          <li><b>${run.stats.correct}</b> right &middot; <b>${run.stats.wrong}</b> wrong (${acc}%)</li>
+          <li>Clears: <b>${profile.records.wins}</b></li>
+        </ul>
+        <p class="unlock">\u{1F513} Endless run unlocked. It never stops getting harder.</p>
+        <button class="btn primary big" id="again">Back to camp</button>
+      </div>
+    </div>`);
+  $('#again').onclick = () => { sfx.tap(); screenHub(); };
+}
+
+function loseRun() {
+  run.over = true;
+  sfx.lose();
+  const acc = run.stats.correct + run.stats.wrong
+    ? Math.round(run.stats.correct / (run.stats.correct + run.stats.wrong) * 100) : 0;
+  const trophies = checkTrophies(profile, difficultyLevel(profile.mastery, profile.grade));
+  const levelUp = levelUpLine();
+  persist();
+  render(`
+    <div class="screen center">
+      <div class="panel lose">
+        <h2>You fell on floor ${run.depth}</h2>
+        <div class="big-art">\u{1F480}</div>
+        <ul class="run-stats">
+          <li><b>${run.stats.battlesWon}</b> monsters beaten</li>
+          <li><b>${run.stats.correct}</b> right &middot; <b>${run.stats.wrong}</b> wrong (${acc}%)</li>
+          <li>Deepest floor ever: <b>${profile.records.deepest}</b></li>
+        </ul>
+        ${levelUp}
+        ${trophyLines(trophies)}
+        <button class="btn primary big" id="again">Run again</button>
+        <button class="btn ghost" id="home">Back to camp</button>
+      </div>
+    </div>`);
+  $('#again').onclick = () => { sfx.tap(); withEvolutions(() => beginRun()); };
+  $('#home').onclick = () => { sfx.tap(); withEvolutions(screenHub); };
+}
+
+/* A shared keypad. Middle school answers can be fractions, decimals or
+   negative, so those keys appear wherever a written answer is typed. Strike
+   answers are always whole numbers of at least one, so that keypad stays
+   digits only and keeps its big three-column targets. */
+function keypadHtml({ submitId, submitLabel, ready, extras = false }) {
+  const digits = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+  if (!extras) {
+    return `
+      <div class="keypad">
+        ${digits.map(n => `<button class="key" data-k="${n}">${n}</button>`).join('')}
+        <button class="key" data-k="back">\u232B</button>
+        <button class="key" data-k="0">0</button>
+        <button class="key strike" id="${submitId}" ${ready ? '' : 'disabled'}>${submitLabel}</button>
+      </div>`;
+  }
+  const rows = [[1, 2, 3, '/'], [4, 5, 6, '.'], [7, 8, 9, '-']];
+  return `
+    <div class="keypad four">
+      ${rows.flat().map(k => `<button class="key ${typeof k === 'string' ? 'sym' : ''}" data-k="${k}">${k === '-' ? '\u2212' : k}</button>`).join('')}
+      <button class="key" data-k="back">\u232B</button>
+      <button class="key" data-k="0">0</button>
+      <button class="key strike wide" id="${submitId}" ${ready ? '' : 'disabled'}>${submitLabel}</button>
+    </div>`;
+}
+
+/* ======================================================== number entry === */
+/* Shared typed-answer panel. No multiple choice anywhere in this game:
+   a guess has to be a number the kid actually produced. */
+function askNumber({ title, art, prompt, sub, onSubmit, extras = true }) {
+  let typed = '';
+  const startedAt = performance.now();
+  const draw = () => {
+    render(`
+      <div class="screen center">
+        ${run ? topBar() : ''}
+        <div class="panel ask">
+          <h2>${title}</h2>
+          <div class="big-art">${art}</div>
+          <p class="prompt">${prompt}</p>
+          ${sub ? `<p class="muted tiny">${sub}</p>` : ''}
+          <div class="answer-box ${typed ? 'filled' : ''}">${typed || '_'}</div>
+          ${keypadHtml({ submitId: 'go', submitLabel: 'ANSWER', ready: !!typed, extras })}
+        </div>
+      </div>`);
+    $$('.key').forEach(b => b.onclick = () => {
+      typed = typeInto(typed, b.dataset.k);
+      sfx.tap(); draw();
+    });
+    const go = $('#go');
+    if (go) go.onclick = () => onSubmit(typed, Math.round(performance.now() - startedAt));
+  };
+  draw();
+}
+
+function resultCard({ correct, answer, given, body, onNext }) {
+  render(`
+    <div class="screen center">
+      ${run ? topBar() : ''}
+      <div class="panel ${correct ? 'win' : 'lose'}">
+        <h2>${correct ? 'Correct' : 'Not quite'}</h2>
+        <div class="big-art">${correct ? '✅' : '❌'}</div>
+        ${correct ? '' : `<p>The answer was <b>${answer}</b>. You said ${given ? esc(given) : '—'}.</p>`}
+        <p>${body}</p>
+        <button class="btn primary" id="next">Continue</button>
+      </div>`);
+  $('#next').onclick = () => { sfx.tap(); onNext(); };
+}
+
+/* ============================================================== riddle === */
+function screenRiddle() {
+  const r = generateRiddle(run.rng, profile.mastery, run.recentRiddles, profile.grade);
+  run.recentRiddles = [r.id, ...run.recentRiddles].slice(0, 5);
+  askNumber({
+    title: 'Riddle Shrine',
+    art: '\u{1F52E}',
+    prompt: esc(r.text),
+    sub: 'Solve it for a relic. Get it wrong and the shrine bites.',
+    onSubmit: (text, ms) => {
+      const { ok: correct } = checkAnswer(text, r.answer);
+      recordAttempt(profile.mastery, { skill: r.skill, fact: null, correct, ms });
+      const day = store.todayEntry(profile);
+      correct ? (day.correct += 1, run.stats.correct += 1) : (day.wrong += 1, run.stats.wrong += 1);
+      const heal = run.player.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+        .reduce((s, x) => s + (x.riddleHeal || 0), 0);
+      if (correct) {
+        if (heal) run.player.hp = Math.min(run.player.maxHp, run.player.hp + heal);
+        sfx.reward();
+      } else {
+        run.player.hp -= 6; run.player.combo = 0; sfx.wrong();
+      }
+      persist();
+      if (run.player.hp <= 0) return loseRun();
+      resultCard({
+        correct, answer: formatAnswer(r.answer), given: text,
+        body: correct ? `The shrine opens.${heal ? ` ❤️ +${heal}` : ''}` : 'You take 6 damage and the shrine seals.',
+        onNext: () => correct ? screenRelicPick(() => leaveNode()) : leaveNode(),
+      });
+    },
+  });
+}
+
+/* ============================================================ treasure === */
+function screenTreasure() {
+  /* The chest lock is a place-value / estimation question, so treasure nodes
+     exercise a different skill than combat does. */
+  const rng = run.rng;
+  // Digits are built so the answer is never 0, which reads as a broken question.
+  const n = (1 + Math.floor(rng() * 9)) * 1000 + (1 + Math.floor(rng() * 9)) * 100
+          + (1 + Math.floor(rng() * 9)) * 10 + Math.floor(rng() * 10);
+  const kind = Math.floor(rng() * 3);
+  const q = kind === 0
+    ? { text: `The lock reads <b>${n}</b>. Round it to the nearest HUNDRED.`, answer: Math.round(n / 100) * 100 }
+    : kind === 1
+      ? { text: `The lock reads <b>${n}</b>. What is the value of the TENS digit? (In 4560 it is 60.)`, answer: Math.floor(n / 10) % 10 * 10 }
+      : { text: `The lock reads <b>${n}</b>. Round it to the nearest TEN.`, answer: Math.round(n / 10) * 10 };
+
+  askNumber({
+    title: 'Locked Chest', art: '\u{1F4E6}', prompt: q.text,
+    sub: 'Crack the lock to take what is inside.',
+    onSubmit: (text, ms) => {
+      const { ok: correct } = checkAnswer(text, q.answer);
+      recordAttempt(profile.mastery, { skill: 'place_est', fact: null, correct, ms });
+      const day = store.todayEntry(profile);
+      correct ? (day.correct += 1, run.stats.correct += 1) : (day.wrong += 1, run.stats.wrong += 1);
+
+      let body = 'The chest stays shut.';
+      if (correct) {
+        const missingRune = unlockedOps(profile.mastery, profile.grade).find(o => !run.player.runes.includes(o));
+        if (missingRune && run.rng() < 0.6) {
+          run.player.runes.push(missingRune);
+          body = `Inside is the <b>${RUNES[missingRune].name}</b> (${RUNES[missingRune].glyph}). You can use it for the rest of this run.`;
+        } else {
+          const gold = 20 + run.depth * 4;
+          run.player.gold += gold;
+          body = `\u{1FA99} +${gold} gold.`;
+        }
+        sfx.reward();
+      } else { sfx.wrong(); }
+      persist();
+      resultCard({ correct, answer: formatAnswer(q.answer), given: text, body, onNext: () => leaveNode() });
+    },
+  });
+}
+
+/* ================================================================ shop === */
+function screenShop() {
+  const p = run.player;
+  const stock = offerRelics(run.rng, p.relics, 2)
+    .map(r => ({ kind: 'relic', relic: r, price: 35 + run.depth * 3 }));
+  stock.push({ kind: 'heal', price: 20, label: 'Healing draught', art: '\u{1F9EA}', text: 'Restore 18 health.' });
+  const missingRune = unlockedOps(profile.mastery, profile.grade).find(o => !p.runes.includes(o));
+  if (missingRune) stock.push({ kind: 'rune', op: missingRune, price: 45, label: RUNES[missingRune].name, art: RUNES[missingRune].glyph, text: 'Adds this operator for the rest of the run.' });
+
+  const draw = () => {
+    render(`
+      <div class="screen">
+        ${topBar()}
+        <div class="panel">
+          <h2>\u{1F3EA} The Trader</h2>
+          <p class="muted center">You have <b>${p.gold}</b> gold.</p>
+          <div class="shop-list">
+            ${stock.map((s, i) => {
+              const art = s.kind === 'relic' ? s.relic.art : s.art;
+              const name = s.kind === 'relic' ? s.relic.name : s.label;
+              const text = s.kind === 'relic' ? s.relic.text : s.text;
+              const gone = s.sold;
+              return `<button class="shop-item ${gone ? 'sold' : ''}" data-i="${i}" ${gone || p.gold < s.price ? 'disabled' : ''}>
+                <span class="si-art">${art}</span>
+                <span class="si-body"><b>${esc(name)}</b><small>${esc(text)}</small></span>
+                <span class="si-price">${gone ? 'SOLD' : `\u{1FA99} ${s.price}`}</span>
+              </button>`;
+            }).join('')}
+          </div>
+          <button class="btn primary" id="leave">Leave the shop</button>
+        </div>
+      </div>`);
+    $$('.shop-item').forEach(b => b.onclick = () => {
+      const s = stock[+b.dataset.i];
+      if (s.sold || p.gold < s.price) return;
+      p.gold -= s.price; s.sold = true;
+      if (s.kind === 'relic') p.relics.push(s.relic.id);
+      if (s.kind === 'heal') p.hp = Math.min(p.maxHp, p.hp + 18);
+      if (s.kind === 'rune') p.runes.push(s.op);
+      sfx.reward(); persist(); draw();
+    });
+    $('#leave').onclick = () => { sfx.tap(); leaveNode(); };
+  };
+  draw();
+}
+
+/* ================================================================ rest === */
+function screenRest() {
+  const p = run.player;
+  render(`
+    <div class="screen center">
+      ${topBar()}
+      <div class="panel">
+        <h2>\u{1F3E5} Healer</h2>
+        <p class="muted center">Take one.</p>
+        <div class="choices">
+          <button class="choice" id="heal"><span class="ci">❤️</span><b>Rest</b><small>Heal ${Math.round(p.maxHp * HEALER_SHARE)} health</small></button>
+          <button class="choice" id="train"><span class="ci">\u{1F4AA}</span><b>Train</b><small>+8 max health, permanently this run</small></button>
+        </div>
+      </div>
+    </div>`);
+  $('#heal').onclick = () => { p.hp = Math.min(p.maxHp, p.hp + Math.round(p.maxHp * HEALER_SHARE)); sfx.reward(); persist(); leaveNode(); };
+  $('#train').onclick = () => { p.maxHp += 8; p.hp += 8; sfx.reward(); persist(); leaveNode(); };
+}
+
+/* ========================================================== relic pick === */
+function screenRelicPick(onDone) {
+  const offer = offerRelics(run.rng, run.player.relics, 3);
+  if (!offer.length) return onDone();
+  render(`
+    <div class="screen center">
+      ${topBar()}
+      <div class="panel">
+        <h2>Choose a relic</h2>
+        <div class="choices vertical">
+          ${offer.map((r, i) => `
+            <button class="choice wide" data-i="${i}">
+              <span class="ci">${r.art}</span>
+              <b>${esc(r.name)}</b>
+              <small>${esc(r.text)}</small>
+            </button>`).join('')}
+        </div>
+        <button class="btn ghost small" id="skip">Skip</button>
+      </div>
+    </div>`);
+  $$('.choice').forEach(b => b.onclick = () => {
+    run.player.relics.push(offer[+b.dataset.i].id);
+    if (!profile.meta.unlockedRelics.includes(offer[+b.dataset.i].id)) profile.meta.unlockedRelics.push(offer[+b.dataset.i].id);
+    sfx.reward(); persist(); onDone();
+  });
+  $('#skip').onclick = () => { sfx.tap(); onDone(); };
+}
+
+/* Beating a boss permanently unlocks a starting rune for future runs. */
+function grantBossUnlock() {
+  const meta = profile.meta;
+  if (meta.bonusHp >= 40) return `\u{1F451} You have felled every crown. Nothing left to unlock.`;
+  meta.bonusHp += 5;
+  return `\u{1F451} Every future run now starts with <b>+${meta.bonusHp}</b> extra health.`;
+}
+
+/* ======================================================= grown-up area === */
+/* A deliberately un-8-year-old-friendly gate. Not security, just friction. */
+function parentGate() {
+  let typed = '';
+  const answer = 391;
+  const draw = () => {
+    render(`
+      <div class="screen center">
+        <div class="panel ask">
+          <h2>Grown-ups only</h2>
+          <p class="prompt">What is 23 &times; 17?</p>
+          <div class="answer-box ${typed ? 'filled' : ''}">${typed || '_'}</div>
+          ${keypadHtml({ submitId: 'go', submitLabel: 'ENTER', ready: true, extras: false })}
+          <button class="btn ghost small" id="back">Back</button>
+        </div>
+      </div>`);
+    $$('.key').forEach(b => b.onclick = () => { typed = typeInto(typed, b.dataset.k); draw(); });
+    $('#go').onclick = () => {
+      if (parseAnswer(typed)?.value === answer) screenReport();
+      else { typed = ''; draw(); }
+    };
+    $('#back').onclick = () => (profile ? screenHub() : screenProfiles());
+  };
+  draw();
+}
+
+/* "7*8" is how a fact is keyed; "7 x 8" is how a person reads it. */
+function fmtFact(key) {
+  return key.replace('*', ' \u00d7 ').replace('/', ' \u00f7 ').replace('+', ' + ').replace('-', ' \u2212 ');
+}
+
+function fmtMinutes(ms) {
+  const m = Math.round(ms / 60000);
+  if (m < 60) return `${m} min`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+function screenReport() {
+  const list = data.profiles;
+  const rows = list.map(p => {
+    const totalMs = p.days.reduce((s, d) => s + d.ms, 0);
+    const correct = p.days.reduce((s, d) => s + d.correct, 0);
+    const wrong = p.days.reduce((s, d) => s + d.wrong, 0);
+    const acc = correct + wrong ? Math.round(correct / (correct + wrong) * 100) : 0;
+
+    const bars = SKILLS.map(s => {
+      const rec = p.mastery.skills[s.id] || { attempts: 0, correct: 0, totalMs: 0 };
+      const score = Math.round(skillScore(rec, s.id) * 100);
+      const seen = rec.attempts;
+      const acc2 = seen ? Math.round(rec.correct / seen * 100) : 0;
+      const avg = seen ? Math.round(rec.totalMs / seen / 100) / 10 : 0;
+      const state = seen < 4 ? 'untested' : score >= 70 ? 'solid' : score >= 40 ? 'working' : 'weak';
+      return `<div class="skill-row ${state}">
+        <div class="sr-label">${esc(s.label)}</div>
+        <div class="bar skill"><span style="width:${score}%"></span></div>
+        <div class="sr-meta">${seen < 4 ? 'not enough data' : `${acc2}% right &middot; ${avg}s avg &middot; ${seen} tries`}</div>
+      </div>`;
+    }).join('');
+
+    const shaky = shakyFacts(p.mastery, 10);
+    const guessy = shaky.filter(f => f.accuracy < 0.6 && f.avgMs < 3000);
+
+    const last14 = [];
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      const e = p.days.find(x => x.date === key);
+      last14.push({ key, ms: e ? e.ms : 0 });
+    }
+    const maxMs = Math.max(1, ...last14.map(d => d.ms));
+
+    return `
+      <div class="report-card">
+        <div class="hero-row">
+          <span class="pa big">${p.avatar}</span>
+          <div><h3>${esc(p.name)}</h3>
+            <p class="muted">${fmtMinutes(totalMs)} played &middot; ${correct + wrong} problems &middot; <b>${acc}%</b> right &middot; deepest floor ${p.records.deepest}</p>
+          </div>
+        </div>
+
+        <h4>Where they are</h4>
+        <div class="skills">${bars}</div>
+
+        <h4>Facts to drill</h4>
+        ${shaky.length
+          ? `<div class="facts">${shaky.map(f => `<span class="fact ${f.accuracy < 0.5 ? 'bad' : ''}">${esc(fmtFact(f.key))} <small>${Math.round(f.accuracy * 100)}% &middot; ${(f.avgMs / 1000).toFixed(1)}s</small></span>`).join('')}</div>`
+          : '<p class="muted tiny">Nothing to drill. Every fact they have met is quick and correct.</p>'}
+        ${guessy.length ? `<p class="flag">⚠️ Answering fast and wrong on: ${guessy.map(f => esc(fmtFact(f.key))).join(', ')}. That pattern usually means guessing, not a gap in knowledge.</p>` : ''}
+
+        <h4>Last 14 days</h4>
+        <div class="spark">${last14.map(d => `<span class="sp" style="height:${Math.max(3, d.ms / maxMs * 40)}px" title="${d.key}: ${fmtMinutes(d.ms)}"></span>`).join('')}</div>
+
+        <h4>School year</h4>
+        <p class="muted tiny">Only a starting point. Their own answers lift them past it; it only comes down if they are getting problems wrong. Raise it if they are being served work below them; lower it if they are struggling. Changing it never touches their record.</p>
+        <div class="grades compact">
+          ${GRADES.map(g => `<button class="grade ${p.grade === g.id ? 'on' : ''}" data-grade-for="${p.id}" data-grade="${g.id}"><b>${g.label}</b></button>`).join('')}
+        </div>
+
+        <div class="card-actions">
+          <button class="btn ghost small" data-drills="${p.id}">Timed drill turns: <b>${p.prefs?.drills === false ? 'off' : 'on'}</b></button>
+          <button class="btn ghost small" data-export="${p.id}">Back up / move ${esc(p.name)}</button>
+        </div>
+        <p class="muted tiny">Every second turn the game picks a problem, weighted to the facts they avoid, with a clock set from their own answering speed. Turn it off if the timer causes more stress than it is worth.</p>
+
+        <details class="danger">
+          <summary>Reset ${esc(p.name)}</summary>
+          <p class="muted tiny">Wipes progress and the learning record for this hero. Cannot be undone.</p>
+          <button class="btn danger small" data-reset="${p.id}">Delete this hero</button>
+        </details>
+      </div>`;
+  }).join('');
+
+  render(`
+    <div class="screen report">
+      <div class="report-head">
+        <h2>Report card</h2>
+        <button class="btn ghost small" id="back">Done</button>
+      </div>
+      <div class="head-actions">
+        <button class="btn ghost small" id="importBtn">Bring a hero in</button>
+        ${data.profiles.length > 1 ? '<button class="btn ghost small" id="exportAll">Back up everything</button>' : ''}
+      </div>
+      <p class="muted tiny">Bars combine accuracy and speed, weighted toward recent answers, and stay low until there are enough attempts to judge. Word problems and place value are scored on accuracy alone, since reading and reasoning should take longer. Nothing here leaves this device.</p>
+      ${rows || '<p class="muted">No heroes yet.</p>'}
+    </div>`);
+
+  $('#back').onclick = () => (profile ? screenHub() : screenProfiles());
+  $('#importBtn').onclick = () => { sfx.tap(); screenImport(); };
+  const exAll = $('#exportAll');
+  if (exAll) exAll.onclick = () => { sfx.tap(); screenBackup(data.profiles); };
+  $$('[data-grade-for]').forEach(b => b.onclick = () => {
+    const hero = data.profiles.find(x => x.id === b.dataset.gradeFor);
+    if (!hero) return;
+    const next = Number(b.dataset.grade);
+    hero.grade = hero.grade === next ? 0 : next;  // tapping the current one clears it
+    persist(); sfx.tap(); screenReport();
+  });
+  $$('[data-drills]').forEach(b => b.onclick = () => {
+    const hero = data.profiles.find(x => x.id === b.dataset.drills);
+    if (!hero) return;
+    hero.prefs = { ...hero.prefs, drills: hero.prefs?.drills === false };
+    persist(); sfx.tap(); screenReport();
+  });
+  $$('[data-export]').forEach(b => b.onclick = () => {
+    const hero = data.profiles.find(x => x.id === b.dataset.export);
+    if (hero) { sfx.tap(); screenBackup([hero]); }
+  });
+  $$('[data-reset]').forEach(b => b.onclick = () => {
+    const id = b.dataset.reset;
+    data.profiles = data.profiles.filter(x => x.id !== id);
+    if (data.activeId === id) { data.activeId = null; profile = null; run = null; }
+    persist(); screenReport();
+  });
+}
+
+/* ===================================================== backup / restore ===
+   There is no account and no server, so a hero exists in exactly one browser
+   on one device. Both paths are offered on every screen below, because a
+   download and a file picker are not reliable inside an installed web app on
+   every phone, while copy and paste always is. */
+
+function screenBackup(profiles, onDone = screenReport) {
+  const text = JSON.stringify(store.exportPayload(profiles), null, 2);
+  const filename = store.exportFilename(profiles);
+  const who = profiles.length === 1 ? esc(profiles[0].name) : `all ${profiles.length} heroes`;
+
+  render(`
+    <div class="screen report">
+      <div class="report-head">
+        <h2>Back up ${who}</h2>
+        <button class="btn ghost small" id="back">Done</button>
+      </div>
+      <div class="report-card">
+        <p class="muted tiny">This is the whole record: heroes, progress and everything the report card is built from. Save the file somewhere safe, or paste the text into the other device under "Bring a hero in". Importing does not remove it from this device, so you can keep playing here.</p>
+        <div class="head-actions">
+          <button class="btn primary small" id="download">Download the file</button>
+          <button class="btn ghost small" id="copy">Copy the text</button>
+        </div>
+        <p class="muted tiny" id="status"></p>
+        <textarea class="backup-box" id="payload" readonly spellcheck="false">${esc(text)}</textarea>
+      </div>
+    </div>`);
+
+  const status = $('#status');
+  $('#back').onclick = () => { sfx.tap(); onDone(); };
+
+  $('#download').onclick = () => {
+    try {
+      const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      status.textContent = `Saved as ${filename}.`;
+      sfx.reward();
+    } catch {
+      status.textContent = 'This device would not download the file. Use "Copy the text" instead.';
+    }
+  };
+
+  $('#copy').onclick = async () => {
+    const box = $('#payload');
+    try {
+      await navigator.clipboard.writeText(text);
+      status.textContent = 'Copied. Paste it into the other device.';
+      sfx.reward();
+    } catch {
+      box.focus();
+      box.select();
+      status.textContent = 'Copying was blocked. The text is selected, copy it by hand.';
+    }
+  };
+}
+
+function screenImport() {
+  render(`
+    <div class="screen report">
+      <div class="report-head">
+        <h2>Bring a hero in</h2>
+        <button class="btn ghost small" id="back">Cancel</button>
+      </div>
+      <div class="report-card">
+        <p class="muted tiny">Load a backup made on another device. Either pick the file, or paste the text you copied.</p>
+        <input type="file" id="file" accept="application/json,.json">
+        <p class="muted tiny center">or</p>
+        <textarea class="backup-box" id="paste" placeholder="Paste the backup text here" spellcheck="false"></textarea>
+        <button class="btn primary small" id="go">Bring them in</button>
+        <p class="flag" id="err" hidden></p>
+      </div>
+    </div>`);
+
+  const fail = msg => { const e = $('#err'); e.hidden = false; e.textContent = msg; sfx.wrong(); };
+  $('#back').onclick = () => { sfx.tap(); screenReport(); };
+  $('#file').onchange = async ev => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    try { handleImport(await f.text()); } catch { fail('That file could not be read.'); }
+  };
+  $('#go').onclick = () => {
+    const text = $('#paste').value.trim();
+    if (!text) return fail('Paste the backup text first, or pick the file.');
+    handleImport(text);
+  };
+
+  function handleImport(text) {
+    let heroes;
+    try { heroes = store.parseImport(text); } catch (e) { return fail(e.message); }
+    const existing = new Set(data.profiles.map(h => h.id));
+    const clashes = heroes.filter(h => existing.has(h.id));
+    if (!clashes.length) return commitImport(heroes, 'add');
+    screenImportClash(heroes, clashes);
+  }
+}
+
+/* The same hero imported onto a device that already has them. Merging two
+   divergent learning records would invent data, so the parent picks. */
+function screenImportClash(heroes, clashes) {
+  render(`
+    <div class="screen center">
+      <div class="panel">
+        <h2>Already here</h2>
+        <p class="center">${clashes.map(h => esc(h.name)).join(', ')} ${clashes.length === 1 ? 'is' : 'are'} already on this device.</p>
+        <div class="choices vertical">
+          <button class="choice wide" id="replace">
+            <span class="ci">\u{1F504}</span><b>Use the backup</b>
+            <small>Overwrite what is on this device. Right when the backup is the newer one.</small>
+          </button>
+          <button class="choice wide" id="copy">
+            <span class="ci">\u{1F465}</span><b>Keep both</b>
+            <small>Add the backup alongside, as a second hero. Nothing is overwritten.</small>
+          </button>
+        </div>
+        <button class="btn ghost small" id="cancel">Cancel</button>
+      </div>
+    </div>`);
+  $('#replace').onclick = () => commitImport(heroes, 'replace');
+  $('#copy').onclick = () => commitImport(heroes, 'copy');
+  $('#cancel').onclick = () => { sfx.tap(); screenReport(); };
+}
+
+function commitImport(heroes, mode) {
+  const names = [];
+  for (const hero of heroes) {
+    const at = data.profiles.findIndex(h => h.id === hero.id);
+    if (at === -1) { data.profiles.push(hero); names.push(hero.name); continue; }
+    if (mode === 'replace') { data.profiles[at] = hero; names.push(hero.name); }
+    else { const dup = store.asCopy(hero); data.profiles.push(dup); names.push(dup.name); }
+  }
+  persist();
+  sfx.win();
+  render(`
+    <div class="screen center">
+      <div class="panel win">
+        <h2>Brought in</h2>
+        <div class="big-art">\u2705</div>
+        <p class="center">${names.map(esc).join(', ')} ${names.length === 1 ? 'is' : 'are'} on this device now.</p>
+        <p class="muted tiny center">Progress from here is separate again. Back up whichever device they actually play on.</p>
+        <button class="btn primary" id="done">Done</button>
+      </div>
+    </div>`);
+  $('#done').onclick = () => { sfx.tap(); screenReport(); };
+}
+
+/* ============================================================ keyboard === */
+/* Physical keyboards should work as well as the on-screen pad. */
+document.addEventListener('keydown', ev => {
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  if ($('#world') && !app.dataset.busy) {
+    const dir = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0],
+                  w: [0, -1], s: [0, 1], a: [-1, 0], d: [1, 0] }[ev.key];
+    if (dialogOpen()) {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); $('#wdialog [data-db]')?.click(); }
+      return;
+    }
+    if (dir) { ev.preventDefault(); worldStep(dir[0], dir[1]); }
+    return;
+  }
+  if (app.dataset.busy) { if (fxSkip) { ev.preventDefault(); fxSkip(); } return; }
+  const scene = app.querySelector('.win-scene:not(.done), .evolve-screen:not(.done)');
+  if (scene) { ev.preventDefault(); scene.classList.add('done'); return; }
+  if (ev.target && /^(INPUT|TEXTAREA)$/.test(ev.target.tagName)) return;
+  let btn = null;
+  if (/^[0-9]$/.test(ev.key)) btn = app.querySelector(`.key[data-k="${ev.key}"]`);
+  else if (ev.key === 'Backspace') btn = app.querySelector('.key[data-k="back"]');
+  else if (ev.key === 'Enter') btn = app.querySelector('#strike:not([disabled]), #answer:not([disabled]), #go:not([disabled]), #vsGo:not([disabled]), #vsReady, #next, #cont, #evoOk');
+  if (btn && !btn.disabled) { ev.preventDefault(); btn.click(); }
+});
+
+/* ====================================================== service worker === */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js', { scope: './', updateViaCache: 'none' })
+      .then(reg => reg.update())
+      .catch(() => { /* offline install optional */ });
+  });
+
+  /* When a new worker takes over, the page is still running the old code.
+     Reload once so a deploy actually reaches the device instead of waiting
+     for someone to guess that they need to refresh twice. The flag stops it
+     looping if a worker ever activates repeatedly. */
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloading) return;
+    reloading = true;
+    location.reload();
+  });
+}
+
+boot();

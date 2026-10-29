@@ -1,0 +1,689 @@
+# Runebreaker
+
+A math roguelike for kids roughly 7-11. Built because Prodigy-style games put the
+math in front of the fun as a toll gate, which teaches kids to rush the questions
+to get to the game. Here the arithmetic **is** the move.
+
+Static site, no build step, no accounts, no network calls. Works offline once
+loaded. Two or more kids share one device through separate hero profiles.
+
+## How the game works
+
+A run is 20 floors. Each floor offers a choice of 2-3 nodes (monster, elite,
+riddle shrine, locked chest, trader, campfire), with a boss every fifth floor.
+Clear floor 20 and you win the run, which unlocks an endless mode. Die and you
+start over, keeping only your learning record and a small permanent health bonus.
+
+### The combat loop
+
+You hold a hand of number tiles and the operator runes you have earned. On your
+turn you pick **tile, rune, tile**, then **type the answer yourself**. The result
+is your damage.
+
+Three things make this different from a quiz with a sword on top:
+
+1. **Nothing is multiple choice.** The kid produces a number or nothing happens.
+   There is no list to guess from and no way to click through.
+2. **The biggest number is usually the wrong play.** Enemies carry three things,
+   all printed on their card: **armor** (flat reduction), a **ward** that doubles
+   or triples matching results, and a **resist** that punishes overshooting.
+
+   A real example taken straight out of the game. Hand of `5, 2, 12, 8, 8`
+   against a Remainder Knight with armor 44, "square numbers hit TRIPLE", and
+   "results over 103 barely scratch it":
+
+   | play | result | damage |
+   | --- | --- | --- |
+   | `12 x 8` (the biggest) | 96 | 52 |
+   | `8 x 8` (a square) | 64 | **148** |
+
+   The smaller number hits nearly three times harder. Working out which play
+   wins means computing several of them in your head first, which is the entire
+   point of the design.
+
+   Resists exist specifically because multiplication hands a kid a damage
+   ceiling ten times higher than addition. Without them, "multiply the two
+   biggest tiles" is correct four turns in five and the thinking disappears.
+   There is a test that measures this and fails the build if the obvious play
+   stops being wrong often enough (`the biggest number is often NOT the best
+   play`, currently about half of all turns).
+3. **Exact-target shields.** Some enemies raise a shield that only breaks on an
+   exact result, so the kid has to search their hand for a combination that makes
+   a specific number. Shield targets are always numbers their current tile range
+   can actually produce.
+
+A wrong answer deals no damage, ends the turn, resets the combo, and shows the
+correct answer plus a one-line strategy hint ("7 x 8 is 7 x 4 doubled: 28 + 28").
+The tiles stay in hand so the next turn is a chance to redo the same fact having
+just been told the answer. Getting it wrong costs you the fight, slowly, which is
+real pressure without a wall.
+
+### Drill turns
+
+Turns alternate. On a **built turn** the player picks the numbers, which is
+where the thinking is. On a **drill turn** the game picks, and it picks what
+they have been avoiding.
+
+That second half exists because the first half has a hole: when the kid chooses
+every play, a kid who hates `7 x 8` can go a whole run without ever making
+`7 x 8`. The hand generator stacks the deck toward their weak skills but cannot
+force the shot. Drill turns can.
+
+A drill shows the enemy's telegraphed move, a problem, and a draining clock.
+Answer in time and you **parry** the move and **counter** for damage equal to
+your answer. Miss, or run out of time, and the move lands, the combo resets,
+and you get the correct answer plus a strategy hint.
+
+Two deliberate limits:
+
+- **The counter gets no ward or resist bonus.** The player did not choose the
+  number, so the reward is for speed and accuracy alone. A well-chosen built
+  strike can triple its damage off a ward; a drill counter never can. That
+  keeps the thinking half of the game the half with the high ceiling.
+- **The clock comes from the child, not from a constant.** The allowance is
+  their own average time for that kind of problem, plus a moment to read it,
+  clamped to 4-20 seconds. A quicker kid gets real pressure, a slower one gets
+  a fair window, and the window tightens by itself as they improve. A fixed
+  countdown would be trivial for one and demoralising for the other.
+
+There is a real argument in maths education that timed drills feed maths
+anxiety, associated most publicly with Jo Boaler's work on timed testing. It is
+contested rather than settled. The design takes it seriously rather than
+dismissing it: the clock is personal rather than fixed, a miss costs damage in
+a fight rather than producing a failure screen, and **drills can be switched
+off per hero** from the grown-up screen, so one kid can have them and their
+brother can not.
+
+Balance is measured rather than guessed, by bots that play full runs. There are
+two personas, because a hero with no declared grade never climbs past fifth
+grade content and would leave everything above it untested. Each clears roughly
+70% of runs, with deaths in the back half rather than walling early.
+
+That is easier than the 38% measured before the middle school work, and mostly
+because the game used to be accidentally hard. Enemy health is budgeted against
+what the player can hit for, and turns alternate, so it has to account for both
+kinds: a built strike at eighth grade level hits for a few hundred while a
+handed-out percentage question hits for tens. Budgeting on the built ceiling
+alone made every fight run about twice its intended length. Armor had the same
+problem in a sharper form: scaled to the average of the two, a level-eight
+drill turn delivering 80 ran into 70 armor and did nothing at all, so armor was
+deleting a whole turn type. Both are now sized correctly and the fights are the
+length they were always meant to be.
+
+Getting here took a string of wrong turns worth recording, because each one
+produced a real fix:
+
+- Parrying for free made the bot clear every run, so a parry now leaks 40%.
+- Budgeting a duel like an ordinary fight made it twice as long and killed the
+  bot on floor 3.
+- One apparent difficulty spike was the test harness being slower than the
+  in-game clock, which is why the soak asserts its own answer latency.
+- `expectedDrillDamage` averaged in written problems, which have no calculation
+  to evaluate, so it returned NaN. Boss health became NaN, the duel could never
+  be won, and every run ended on floor 3.
+- The drill screen recomputed each answer from a-op-b, which a written problem
+  does not have, so its expected answer was NaN and the child could not get it
+  right however hard they tried. The bot's accuracy collapsing to 22% is what
+  exposed it.
+
+The last two are why the soak bot now solves the written problems itself and
+reports how many it had to guess: a clear rate measured with a bot that cannot
+read the questions is measuring the bot.
+
+### Boss duels
+
+A boss every third floor, plus one on the final floor. A duel is nothing but
+asked questions: no tile building at all, the whole fight is the drill turn.
+
+Two clocks run. Each question has the personal clock drill turns already use,
+and the duel as a whole has one. Running the duel clock out does not end
+anything: the boss **enrages** and hits twice as hard, so a slow fight gets
+dangerous rather than lost.
+
+Three things a duel does differently, all for the same reason, that the player
+is answering rather than choosing:
+
+- **No ward and no resist.** Both reward aiming for a particular number, which
+  is impossible when the number is handed to you. They are hidden rather than
+  shown and quietly ignored.
+- **No jam and no shield.** There are no tiles to jam, and a shield demanding
+  an exact number cannot be met by a number you did not pick. Both would be
+  free turns dressed up as threats.
+- **Health budgeted against what an answer is worth**, by sampling the drill
+  picker, rather than against the much higher ceiling of a well-chosen built
+  strike. Budgeting a duel the normal way made it run about twice its intended
+  length, and those extra turns were extra damage taken.
+
+A parry blunts a blow rather than stopping it: 40% still lands. That costs only
+a player who is parrying everything, since a kid who misses takes the full hit
+either way. It raises the ceiling without touching the floor.
+
+### Adaptation
+
+Every attempt is classified into a skill (`add_small`, `mult_hard`, `div_easy`
+and so on) and into a specific fact (`7*8`). Both are tracked with an exponential
+moving average, so recent work dominates, plus average response time.
+
+- **Hands are aimed.** The tile generator seeds each hand with a pair that makes
+  the kid's *weakest* available skill the attractive play.
+- **Operator runes unlock in order.** Multiplication appears once addition is
+  solid, division once multiplication is. A run starts with every operator the
+  kid has already earned. Nobody who knows their times tables grinds addition.
+- **Hands target a known weakness, not an untouched one.** A skill the kid has
+  never tried scores zero, so naively taking the minimum would aim at whatever
+  they have never seen and never revisit the fact they keep missing. Known-weak
+  wins, with an occasional deliberate introduction of something new.
+- **Enemy stats are budgeted, not hand-written.** Health, armor, resist
+  thresholds and damage are all derived from the largest hit the player can
+  realistically produce right now, so a fight is 3-7 turns whether they are
+  adding single digits or multiplying twelves. Difficulty tracks the child, not
+  the floor number.
+
+Because a wrong answer costs a turn and every turn costs health, the run length
+is directly coupled to arithmetic accuracy. A kid who guesses dies on floor 4.
+
+## The grown-up report card
+
+Tap "Grown-ups" and answer 23 x 17. Inside, per hero:
+
+- a bar per skill combining accuracy and speed, weighted to recent answers, held
+  low until there are enough attempts to judge
+- the specific facts they are worst at, with accuracy and average time
+- a flag for facts answered **fast and wrong**, which is usually guessing rather
+  than a gap in knowledge
+- total time played and a 14-day activity strip
+
+Everything stays in `localStorage` on the device. Nothing is uploaded.
+
+## Grades 6 to 8
+
+The tile mechanic is integer arithmetic: pick two numbers, combine them, type
+the result. That extends naturally to **negative tiles** and a **power rune**
+for squares and cubes, both of which just work once a strike is defined as
+"any whole result of at least one" rather than as per-operator rules.
+
+It does not extend to fractions, percentages, ratios or solving for x, because
+there is nothing to pick in "what is 15% of 60". Those are **asked** on drill
+turns and at riddle shrines, where the game sets the problem and the player
+types a reply. Percentages and ratios carry the most variants, being the most
+used both in school and out of it.
+
+Answers are parsed rather than compared as integers, so a fraction, a decimal
+or a negative all work, and the keypad grows a slash, a point and a minus when
+the answer could need them. An **equivalent fraction is accepted**: refusing
+6/8 from a child who has correctly worked out three quarters teaches nothing
+except that the game is fussy, so it is marked right and told what simplest
+form is.
+
+Middle school topics need the level to have **actually arrived**, with none of
+the one-level stretch arithmetic gets. Serving percentages to a fourth grader
+is not a stretch, it is a different subject, and a boss duel made of them is a
+wall they cannot climb.
+
+## Heroes
+
+Making a hero asks for a **school year**, 1st through 8th. It is asked as a US
+grade rather than an age because age predicts very little: two eight year olds
+can be two years apart on times tables. The grade only sets where they start,
+opening the operators that year is taught and lifting the first few runs off
+level 1. It is a floor rather than a ceiling, so a kid who races ahead is
+never held back by what was ticked in September.
+
+The floor holds for the first 60 problems. After that it only comes down for
+a kid who is **getting problems wrong**: at 85% right or better it stays put,
+at 75 to 85% it can drop one level, at 65 to 75% two, and below that it
+erodes a level every 30 answers until their own record is all that sets
+difficulty. So a guess that was too high corrects itself, but a kid doing
+well is never handed easier work than they started on.
+
+That last part is a fix. The floor used to erode on the count of problems
+alone, and a real 4th grader at 98% right was about to be dropped to 3rd
+grade work: his own record still looked thin (a few tries on a skill count
+for little until there are a dozen), and he had mostly been playing
+subtraction and times tables, which count as 3rd grade skills. The engine
+test now replays his report card to keep it from coming back.
+
+**Levels go up one at a time.** To leave a level a kid has to show that
+level's own topics, each tried at least 5 times and right 80% of the time
+(the kinder of their lifetime rate and their recent one, so one slip never
+re-closes a level). The topics match the grade descriptions on the hero
+screen: adding and subtracting to 20; times tables 2-5; times tables 6-12
+and dividing by 2-5;
+dividing by 6-12; fractions and decimals; two of percentages, negatives and
+ratios; order of operations and powers; solving for x. Every gate topic has
+to be one its level can actually serve (a test checks): bigger adding and
+subtracting were 2nd grade's at first, but level 2 tiles only go to 10, so
+nobody without a declared grade could ever leave level 2. While a level's
+topics have not been tried enough, about a third of the timed problems aim
+at them, and the camp screen lists them with a 0/5 counter. Reaching a new
+level is announced on the next win or loss.
+
+Before this, the level came from the hardest skill tried four times, so four
+squaring problems with the power rune rated a 4th grader as 7th grade and
+skipped fractions, decimals and percentages. It also had a second check on
+the overall record that swung whenever a new skill was started, dropping a
+kid several levels and then jumping them back; that is gone. Simulated from
+a real 4th grader's report card at 97% right, 5th grade now arrives after
+about 60 more problems, 6th about 45 after that and 7th about 55 after that,
+in order.
+
+The school year can be **changed later** from the report card, since the best
+setting is often not obvious until you have watched a few runs. Changing it
+never touches their record.
+
+Starting a capable child low works, and is a reasonable thing to do
+deliberately. Measured on a simulated strong player declared as 4th grade:
+the power rune is earned around 45 problems, level 5 around 120, level 7
+around 125, and level 8 by roughly 770. Every middle school topic is reached.
+The declared grade is a floor, never a ceiling, so their own record lifts them
+past it as fast as they can demonstrate it.
+
+Heroes are deleted from the picker: **Manage heroes**, then the cross beside
+one. It says how many problems and minutes are about to be lost and offers to
+back the hero up first, because it is the one irreversible action in the game.
+
+Several kids share one device through separate heroes. Each hero has its own
+learning record, its own difficulty level, its own unlocked operators, its own
+drill setting and its own section of the report card. Nothing is shared between
+them.
+
+Add one from the picker: on the hub, **Switch / add hero**, then **Add another
+hero** at the bottom of the list. Give each kid their own rather than sharing
+one, or the adaptation averages two children together and targets neither.
+
+## Heroes surviving an update
+
+Heroes live in `localStorage`, which is a different thing entirely from the
+code cache. Nothing in a release touches it, and no code anywhere clears it.
+Shipping a new version does not cost anyone their progress.
+
+The one way it could have was a schema change. `load()` used to hand the saved
+object straight to the app, so any release that added a field left every
+existing hero without it. Saves now go through `hydrate()`, which fills in
+anything missing and repairs garbled values without ever deleting. A save that
+cannot be parsed at all is left on disk untouched rather than overwritten, so
+there is still something to recover by hand.
+
+`test/storage.test.mjs` loads a save shaped the way an older build wrote it,
+before grades, drill settings, wins or endless mode existed, and asserts the
+hero comes back complete and playable. The browser run does the same end to
+end: it plants an old-shaped save, reloads, and plays a run with it.
+
+**What does lose you a hero is a different browser, not an update.** Storage is
+per browser and per origin. Safari and Chrome on the same phone are two
+separate sets of heroes, and on iOS a home-screen web app has its own container
+separate from the Safari tab it was installed from. Pick one browser per kid's
+device and stay there. On iPhone that should be Safari: it is the only one that
+runs the service worker, which is what makes the app installable and offline,
+and installed web apps are exempt from the seven-day storage eviction that
+ordinary Safari browsing is subject to.
+
+To move a hero between browsers, use the backup below rather than hoping.
+
+## The world
+
+Each floor of a run is a small area to walk around, Pokemon style, instead
+of a menu of choices. The area is built from the floor's nodes (`js/world.js`):
+
+- **Tall grass** 🌿 on every floor: each step in it has a 20% chance of a wild
+  monster, and the sixth step without one is certain. Wild monsters are the
+  ones that can be caught.
+- **Trainer houses** 🏠 (the old elite node): a named trainer sends out two
+  monsters one after the other, health carrying over. Their monsters cannot
+  be caught. Beating both pays gold and a relic.
+- **The healer** 🏥, **the shop** 🏪, **the riddle hall** 🏛 and a **locked
+  chest** 🧰: the old rest, shop, riddle and treasure nodes, each usable once.
+- **Townspeople** with quests (win 2 fights in the grass, catch a monster,
+  a flawless fight, a super effective win, 8 in a row) that pay gold or
+  health, and hints: the fact the kid keeps missing ("7 × 8 = 56, say it
+  three times"), what the next level needs, how types and catching work.
+- **The gate** ⛩ stays sealed until a fight in this area is won. Every third
+  floor the gate is the **boss tower** 🏰.
+
+Walking is the arrow pad on screen, or arrow keys / WASD; bumping into
+something uses it, and text comes up in a Pokemon-style box. The area is
+11 by 13 tiles so it all fits on a phone with no scrolling: time spent
+walking is time not spent on maths, so nothing is more than a few steps
+away and everything in it leads to a problem.
+
+Every layout is checked when it is made (everything reachable, enough grass)
+and the tests check 2,700 of them. Seasons change the ground colour and the
+decorations.
+
+**Balance.** On the old menu a kid picked one thing per floor; in the world
+they can do all of it, which means more healing and more prizes. The healer
+was cut from 50% to 25% of max health, but a later soak run with the bot
+using no special moves still cleared 35 of 35 runs (an earlier ~80% had been
+flattered by the bot wandering into extra grass fights). Enemies now hit 35%
+harder (`WORLD_PRESSURE` in engine.js). With moves in use, the soak bot
+clears 82% with no grade set (31/38) and 81% at 8th grade (29/36), about
+where the game sat before the world.
+
+## Types, catching and the team
+
+Every hero and monster has a **type**, Pokemon style: Water puts out Fire,
+Fire burns Grass, Grass grounds Storm, Storm zaps Water, and Light and Shadow
+hit each other hard. A strong matchup deals 1.5x, a weak one 0.75x, and it
+works both ways, so the enemy hits harder too if it has the edge. It applies
+to built strikes, drill counters and enemy attacks, and the warning above
+the enemy shows the real number.
+
+**Catching.** Winning a fight is a chance to catch that monster, and the
+chance is the maths in that fight: accuracy matters most, a streak and a
+quick answer add a little, and a flawless fight (no wrong answers, three or
+more right) is at least 90%. Elites are a bit harder, bosses harder still,
+and nothing is ever quite certain or hopeless (5% to 95%). The win screen
+says the chance when one gets away, and what would raise it.
+
+**The team.** Up to three, picked at camp from earned heroes and caught
+monsters. In a fight they sit in the top bar with a mark for the matchup
+against the current monster, and tapping one switches for free, any turn,
+even mid-question, so picking the right type is a thinking reward rather than
+a cost. The battle log says the matchup at the start of each fight.
+
+**The monster count went from 8 to 51**: 18 regular monsters, 6 bosses, and
+27 seasonal ones. That was a big part of the game feeling stale. Every
+monster uses one of a handful of balanced mechanic shapes, and health is
+always budgeted from what the player can hit for, so new ones need no
+balance pass of their own.
+
+Measured with the soak bots (default hero, never switching, so a neutral
+mix of matchups): the primary clear rate is unchanged at about 70%, and 8th
+grade is 52% over four runs against 55% before. A kid who always switches
+to the strong matchup will find it easier, which is the point.
+
+## Evolving
+
+Every right answer a character makes while it is the one fighting counts
+toward evolving it: 60 right answers for stage 2, 200 for stage 3. Each
+stage hits a little harder (1.1x, then 1.2x, on top of the type matchup),
+which is the reason to stick with a favourite and build it up.
+
+After the fight, it evolves on a screen of its own, Pokemon style: "What?
+Ember Newt is evolving!", a flicker between the old and new forms that
+speeds up, then the new one holds. It counts from that screen, not before,
+so nothing changes mid-fight without the kid seeing it. An evolution earned
+but never shown (the app closed mid-fight) plays the next time camp opens.
+
+Emoji only stretch so far. Nine characters have a real line where the
+picture changes (chick, hen, peacock; lizard, crocodile, dragon; crab,
+lobster, squid; tiger face, tiger; bat, vampire; sparkle, star, glowing
+star; rain cloud, thunderstorm, wave; candle, flame, comet; snowman,
+snowing snowman). Everything else keeps its picture and gets a new name
+by type (Ember Newt to Blaze Newt to Inferno Newt; Fox to Blaze Fox), a
+glow in its type's colour, and stars. The team screen shows a bar of right
+answers toward the next stage.
+
+## Special moves
+
+Every type has three moves; a character knows the first from the start,
+learns the second when it evolves and the third at full evolution. Right
+answers give 1 energy each (up to 10) and a move costs 6, 8 or 10. Energy carries from fight to fight for the whole run: an early wild monster often falls in four or five answers, so energy that reset each fight meant almost no moves on the first floors. Using one
+is a free action, so the turn still goes to a problem: the maths is the fuel
+and the move is the reward. The energy button sits beside the battle log,
+glows when a move is affordable, and opens a list with locked moves shown
+and when they are learned.
+
+| Type | Stage 1 (6 energy) | Stage 2 (8) | Stage 3 (10) |
+| --- | --- | --- | --- |
+| Fire | Ember Boost: next hit +30% | Flame Burst: 12% of the foe's health | Inferno: next hit +60% |
+| Water | Healing Rain: heal 12% | Tidal Shield: block the next attack | Tsunami: 15% of the foe's health |
+| Grass | Vine Wrap: foe skips its next move | Leech Seed: drain 8% | Regrowth: heal 22% |
+| Storm | Static Shock: next hit ignores armor and resists | Thunderbolt: 12% of the foe's health | Tempest: next two hits +25% |
+| Light | Shine: break shields, heal 6% | Barrier: block the next attack | Radiant Beam: 15% of the foe's health |
+| Shadow | Shadow Sneak: next hit pierces, +15% | Dark Drain: drain 10% | Curse: foe hits 40% softer for 3 attacks |
+
+The first version (costs 3 to 5, bursts of a fifth to a quarter, heals of a
+fifth to a third) had the soak bot clearing 97% of runs, against about 80%
+without moves. Cutting every move back alone still left it at 91 to 100%:
+the problem was how often, not how strong. Two moves a fight meant two
+blocked attacks, which halved the damage taken. Costs of 6, 8 and 10 make it
+about one a fight, a moment rather than a habit.
+
+Damage moves use the type chart too. The evolution screen announces the new
+move.
+
+## Battle a friend
+
+With two or more heroes on a device, camp shows **Battle a friend**. The two
+teams take turns on the one device; a cover screen ("Pass the device to
+Max") hides everything between turns. Each turn is one problem at **that
+kid's own level**, on a clock set from **their own** speed, so brothers years
+apart are an even match. A right answer attacks for 10, times the type
+matchup, evolution power, any move boost, and up to +50% for answering
+quickly; a wrong one misses and shows the answer. Both start on 80 health.
+Moves, team switching and energy all work as in a run.
+
+Every answer goes on that kid's report card and right answers help their
+characters evolve. The winner gets the Champion trophy and 15 gold added to
+their next run. Nothing is taken from the loser.
+
+It is one device only. Two devices would need an online service to connect
+them (sign-ins, a server, possibly a monthly cost), which the game does not
+have and does not need for anything else.
+
+## Seasons
+
+By the device's date: October is **Halloween**, November **Thanksgiving**,
+December **Christmas**. In season the colors change, the camp shows a
+banner with how many of that season's monsters have been caught, and about
+half the monsters and bosses met come from the season's set (9 or 10 per
+season, including a boss). Anything caught is kept for good; an unfinished
+set comes back next year. The Monster Book shows the rest as "?" with the
+month they appear.
+
+`?season=halloween` (or `harvest`, `winter`, `none`) on the address previews
+another season, for a grown-up checking what is coming or for the tests.
+
+## Trophies
+
+24 trophies, every one for the maths: streaks (10, 25), speed (25 and 100
+answers under 3 seconds), clean fights and bosses, right-answer milestones
+(100, 500, 2,000), mastering the times tables and division, five right in
+each middle school topic, word problems, and reaching challenge levels 5, 7
+and 9. Locked ones show exactly what to do, including topics above the kid's
+current level. New ones are announced on the win and lose screens and kept
+in a trophy case at camp.
+
+## Earning heroes
+
+Twenty avatars. Eight to choose from on day one, so picking still feels like a
+choice and two brothers need not look identical, and twelve earned one every
+five floors beaten.
+
+Floors count **cumulatively, across every run, and never reset**. A kid who
+dies on floor four after a good run has still moved four floors closer to the
+next hero, which is exactly the moment the encouragement is worth something.
+Tying it to deepest-floor-ever instead would have put the twentieth at floor
+100, reachable only in endless mode.
+
+Earning one gets its own screen rather than a line in the battle log, since it
+is the only reward in the game that is not about the fight. The picker is
+reached by tapping your hero on the hub, and shows the locked ones with what
+they cost: a locked row a kid can see is most of the motivation.
+
+Heroes saved before this existed are credited their deepest floor rather than
+reading as zero, which is the most that can honestly be inferred.
+
+## The battlefield
+
+The fight is drawn the way kids already know from Pokemon: the enemy up and to
+the right on its platform, the player's own hero down and to the left facing
+it, each with a name box and a health bar that goes green, then yellow, then
+red. The enemy's next move sits in its name box, and any ward, resist, armor or
+shield shows as tags just under the field.
+
+Every move plays out before the next turn. The number you made flies at the
+enemy, it flashes, the damage pops off it and its bar drops. A wrong answer
+fizzles halfway. Then the enemy lunges and your bar drops, or on a drill turn
+you parry it (a blue flash, and the small leak that still gets through) and
+counter. A knockout is a faint: the loser drops and fades.
+
+Choices worth knowing about:
+
+- **The maths resolves first, the picture is a replay.** Damage, mastery and
+  the learning record are all worked out the instant the answer goes in, so
+  the animation cannot change a result, and skipping it loses nothing.
+- **Quick, and tap to skip.** Around half a second a hit, a little over a
+  second for a full exchange. Over eighty-odd problems a run, a
+  slow animation would add minutes of watching and no maths. Any tap or key
+  skips to the next turn.
+- **No clock runs during it.** The drill clock starts after it ends, and the
+  duel clock is paused for its length, so it never costs a kid time.
+- **The field is pinned to the top of the screen.** On a short phone the
+  keypad is below the fold and pressing it scrolls the page; pinning keeps the
+  hit in view instead of playing it off screen.
+- **Reduced motion is honoured.** If the device asks for less motion, the
+  screen just changes and the sound still plays.
+
+## Winning a fight
+
+A knockout leads to a short win scene: a VICTORY banner drops in, the hero
+hops on a stage in the middle, and the beaten enemy lies greyed out to the
+side with dizzy stars. Then a card with the recap and the rewards, and a
+Continue button.
+
+Bosses get the bigger version: BOSS FELLED in gold, light rays turning behind
+the hero, confetti, and a crown dropping onto the hero's head. Regular wins
+stay short on purpose. There are twenty or so a run, and a long scene every
+time would soon be tapped past.
+
+The recap is the fight's maths, the way Pokemon shows experience gained:
+right, wrong, best streak and fastest answer, for that fight only. It rewards
+the speed and accuracy the game is built on, not just the win.
+
+A tap before the scene finishes only skips to the end of it, so a kid still
+tapping through the knockout lands on the rewards rather than past them.
+Continue then moves on. Under reduced motion the finished scene just appears.
+
+## Where progress lives, and moving it
+
+There is no account and no server, which is what makes the game work offline
+with nothing to maintain. The cost is that a hero exists in exactly one browser
+on one device. Phone Safari, phone Chrome and a laptop are three separate sets
+of heroes, and on iOS a home-screen web app has its own storage container
+separate from the Safari tab, so even those two are different.
+
+**Install it to the home screen rather than bookmarking it.** Safari's tracking
+prevention deletes script-written storage for sites not visited in seven days,
+which would wipe a hero over a school holiday. Installed web apps are exempt.
+That is WebKit's documented ITP behaviour rather than something measured here,
+so treat it as a good reason to install rather than a guarantee.
+
+Because of all that, the grown-up screen has **Back up / move** per hero and
+**Bring a hero in**. A backup is a small JSON file holding the whole record:
+heroes, progress, and everything the report card is built from. Both a file
+download and a copyable text box are offered on every screen, because downloads
+and file pickers are not reliable inside an installed web app on every phone
+while copy and paste always is.
+
+Importing a hero who already exists on the device asks before doing anything:
+use the backup, or keep both as separate heroes. It never merges two divergent
+learning records, because combining them would invent attempts that never
+happened. `normalizeProfile` fills in anything missing from an older export, so
+a backup taken before a skill existed still loads with that skill blank rather
+than crashing the report card later.
+
+## Running it
+
+It is a static folder. Open `index.html` through any web server:
+
+```
+cd game
+python3 -m http.server 8124
+# then visit http://127.0.0.1:8124/
+```
+
+It will not run from `file://` because it uses ES modules.
+
+Deployed on GitHub Pages it installs to a phone or tablet home screen (Share →
+Add to Home Screen on iOS, the install prompt on Android) and works with no
+connection after the first load.
+
+## Updates reaching the device
+
+The service worker fetches **everything** from the network first, falling back
+to the cache only when there is no connection. That is deliberate and it is
+worth not "optimising" back.
+
+The obvious setup, and the one this shipped with, is network-first for the page
+and cache-first for scripts and styles. It is quietly broken: `index.html` came
+back fresh on every load while `js/main.js` was served from cache forever,
+because a cached entry is only replaced when the cache name changes. The result
+is a current page running months-old code, with nothing visibly wrong, on the
+one device that matters. It cost a full round of "I don't see the new feature"
+to spot.
+
+The app is a couple of hundred kilobytes of text, so the round trip costs
+nothing worth having, and offline still works the moment the network is gone.
+`test/sw.test.mjs` pins this behaviour, since it is invisible to every other
+test: the game works perfectly while being out of date.
+
+The page also reloads itself once when a new worker takes over, so a deploy
+lands without anyone having to know they must refresh twice. Bumping `CACHE` in
+`sw.js` is what evicts the old files on devices that already have them.
+
+## Tests
+
+```
+./test/run.sh
+```
+
+- `test/sw.test.mjs` — the service worker, driven in a fake worker scope: that
+  scripts are never served stale, that offline still falls back to the cache,
+  that other origins and POSTs are untouched, and that activating clears the
+  old Runebreaker cache without touching the other apps in this repo.
+- `test/storage.test.mjs` — backup and restore: round trips, older exports,
+  hand-edited junk, and that a bad file fails with a message a parent can act
+  on rather than a stack trace.
+- `test/engine.test.mjs` — pure logic: skill classification, mastery maths, hand
+  generation, the damage formula, the balance budget, riddle generators. No
+  browser needed.
+- `test/play.test.mjs` — drives a real Chromium session: makes a hero, fights,
+  answers right and wrong, checks the report card and that progress survives a
+  reload. It runs with reduced motion so it can check state straight after
+  each move, then opens a second page with motion on to check that a strike
+  flies, the damage number pops, the bar drops mid-hit, a tap skips it, and a
+  knockout is shown as a faint, then that the win scene shows its banner and
+  recap and that an early tap finishes it rather than leaving it. Fights are
+  random, so when it walks somewhere (to a boss, to a written question) it
+  plays on through whatever comes up: a counter that ends the fight early, a
+  new hero earned, or a death on a question it could only guess, which just
+  starts another run.
+- `test/soak.test.mjs` — a bot plays a dozen full runs, reading each enemy card
+  and answering perfectly. It catches runtime errors on every screen and keeps
+  the balance honest: it should clear floor 20 roughly half the time. Because it
+  picks its play only from what is printed on screen, it also proves the card
+  tells a player enough to play well. An earlier version of the bot that just
+  multiplied the two biggest tiles died on every single run, which is the
+  clearest evidence the mechanics reward thinking.
+
+## Files
+
+| file | what it holds |
+| --- | --- |
+| `js/data.js` | skills, enemy templates, wards, relics, word-problem generators |
+| `js/engine.js` | mastery tracking, adaptation, damage, enemy budget, map, runs |
+| `js/main.js` | every screen, input handling, the run state machine |
+| `js/collection.js` | characters, teams, catch chance, trophies |
+| `js/world.js` | the walkable area for each floor, and path finding |
+| `js/storage.js` | hero profiles in localStorage |
+| `js/sfx.js` | WebAudio blips, no audio files to download |
+
+`data.js`, `engine.js`, `collection.js` and `world.js` never touch the DOM, which is why the logic is testable.
+
+## Adding English
+
+The structure already allows it and nothing here is math-specific except the
+content. The shortest path:
+
+1. Add English skills to `SKILLS` in `data.js` (`spelling`, `vocab_context`,
+   `grammar_fix`, `reading_detail`).
+2. Add a word-encounter type alongside `battle` in `generateFloor`, where the
+   move is choosing and typing a word rather than a number. The damage formula in
+   `computeDamage` takes a number, so an obvious mapping is word length or a
+   letter-value score, which keeps the ward and armor mechanics working unchanged.
+3. Teach `askNumber` a text sibling for typed word answers.
+
+The report card, adaptation and profile storage pick up new skills automatically
+from the `SKILLS` list.

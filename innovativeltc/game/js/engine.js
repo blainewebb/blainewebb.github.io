@@ -1,0 +1,995 @@
+/* Runebreaker — pure game logic. No DOM, no localStorage.
+   Everything here is deterministic given a seed, so it can be unit tested. */
+
+import { SKILLS, SKILL_BY_ID, classify, factKey, WARDS, RESISTS, ENEMIES, BOSSES, SEASONAL_MONSTERS,
+         RELICS, RELIC_BY_ID, RIDDLES, GRADES, GRADE_BY_ID, ASKED, ASKED_SKILLS,
+         simplifyFraction } from './data.js';
+
+/* ------------------------------------------------------------------ rng --
+   Small seeded PRNG (mulberry32) so a run can be replayed from its seed. */
+export function makeRng(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6D2B79F5;
+    let r = t;
+    r = Math.imul(r ^ (r >>> 15), r | 1);
+    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const ri = (rng, lo, hi) => lo + Math.floor(rng() * (hi - lo + 1));
+const pick = (rng, arr) => arr[Math.floor(rng() * arr.length)];
+
+/* -------------------------------------------------------------- mastery --
+   A profile's learning record. Two layers:
+     skills[] — broad buckets, drive difficulty and the report card bars
+     facts[]  — individual facts like "7x8", drive the "shaky facts" list
+   Mastery is an exponential moving average so recent work counts most. */
+export function blankMastery() {
+  const skills = {};
+  for (const s of SKILLS) skills[s.id] = { attempts: 0, correct: 0, ema: 0.5, totalMs: 0 };
+  return { skills, facts: {} };
+}
+
+export const EMA_ALPHA = 0.25;
+
+/** Record one attempt. `ms` is time-to-answer in milliseconds. */
+export function recordAttempt(mastery, { skill, fact, correct, ms }) {
+  const s = mastery.skills[skill] || (mastery.skills[skill] = { attempts: 0, correct: 0, ema: 0.5, totalMs: 0 });
+  s.attempts += 1;
+  if (correct) s.correct += 1;
+  s.totalMs += ms;
+  s.ema = s.ema * (1 - EMA_ALPHA) + (correct ? 1 : 0) * EMA_ALPHA;
+
+  if (fact) {
+    const f = mastery.facts[fact] || (mastery.facts[fact] = { attempts: 0, correct: 0, ema: 0.5, totalMs: 0 });
+    f.attempts += 1;
+    if (correct) f.correct += 1;
+    f.totalMs += ms;
+    f.ema = f.ema * (1 - EMA_ALPHA) + (correct ? 1 : 0) * EMA_ALPHA;
+  }
+  return mastery;
+}
+
+/** 0..1 confidence that the skill is solid. Slow-but-right still counts, just less. */
+export function skillScore(rec, skillId) {
+  if (!rec || rec.attempts === 0) return 0;
+  const accuracy = rec.ema;
+  const avgMs = rec.totalMs / rec.attempts;
+  const confidence = Math.min(1, rec.attempts / 12); // few attempts = low confidence
+
+  /* Reading and reasoning take time by nature, so those skills are judged on
+     accuracy alone. Fact recall is judged partly on speed, because knowing
+     7 x 8 and working it out from scratch are different things. */
+  if (skillId && SKILL_BY_ID[skillId]?.slow) return accuracy * confidence;
+
+  // Under 5s is full speed credit, over 20s is none. Speed is a 25% weight.
+  const speed = Math.max(0, Math.min(1, (20000 - avgMs) / 15000));
+  return (accuracy * 0.75 + speed * 0.25) * confidence;
+}
+
+/* Facts worth drilling, worst first. A fact the kid answers correctly and
+   quickly is not a drill candidate, so it is left out entirely rather than
+   padding the list: a report card that lists everything tells you nothing. */
+export const DRILL_THRESHOLD = 0.65;
+
+/* Facts are scored differently from skills: no confidence ramp, because a kid
+   only meets any single fact a handful of times, and a heavier speed weight,
+   because the whole point of a number fact is recall rather than derivation.
+   Right but fifteen seconds of counting on fingers still needs drilling. */
+export function factScore(f) {
+  if (!f || f.attempts === 0) return 1;
+  const avgMs = f.totalMs / f.attempts;
+  const speed = Math.max(0, Math.min(1, (15000 - avgMs) / 12000));
+  return f.ema * 0.6 + speed * 0.4;
+}
+
+export function shakyFacts(mastery, limit = 10) {
+  return Object.entries(mastery.facts)
+    .filter(([, f]) => f.attempts >= 2)
+    .map(([key, f]) => ({
+      key,
+      attempts: f.attempts,
+      accuracy: f.correct / f.attempts,
+      avgMs: Math.round(f.totalMs / f.attempts),
+      score: factScore(f),
+    }))
+    .filter(f => f.score < DRILL_THRESHOLD)
+    .sort((a, b) => a.score - b.score)
+    .slice(0, limit);
+}
+
+/* ----------------------------------------------------------- difficulty --
+   One number, 1..6, derived from how the skills the player has actually
+   unlocked are going. It sets tile ranges and enemy scaling. It moves slowly
+   on purpose: a couple of bad answers should not knock the game down a tier. */
+export function totalAttempts(mastery) {
+  return SKILLS.reduce((n, s) => n + (mastery.skills[s.id]?.attempts || 0), 0);
+}
+
+/* The declared grade acts as a floor that erodes as real answers arrive: one
+   level of it falls away every 30 attempts, so within roughly 150 problems
+   the child's own record is the only thing setting difficulty. That gives a
+   sensible first run without letting a parent's guess outlive the evidence,
+   in either direction. */
+export const GRADE_DECAY_ATTEMPTS = 30;
+/* Roughly one run of grace first. Without it the floor dropped a level while
+   the child's own record was still too thin to replace it, and the game
+   visibly got easier thirty problems in. */
+export const GRADE_GRACE_ATTEMPTS = 60;
+
+/** Recent accuracy across everything answered, each skill weighted by how
+    much of it there has been. 1 when there is nothing to go on. */
+export function overallAccuracy(mastery) {
+  let n = 0, sum = 0;
+  for (const sk of SKILLS) {
+    const r = mastery.skills[sk.id];
+    if (!r?.attempts) continue;
+    n += r.attempts;
+    sum += r.ema * r.attempts;
+  }
+  return n ? sum / n : 1;
+}
+
+/* How far a doing-well kid's accuracy lets the grade floor fall. The count
+   of problems alone used to decide it, so a kid getting 97% right whose
+   record was still thin (few tries per skill, or sticking to favourite
+   operations) was dropped below the grade they started at and handed easier
+   work. Now only mistakes lower the floor: mostly right keeps it where it
+   is, and their own record lifts them past it as it fills in. */
+export const GRADE_HOLD_ACCURACY = [
+  { atLeast: 0.85, maxDrop: 0 },
+  { atLeast: 0.75, maxDrop: 1 },
+  { atLeast: 0.65, maxDrop: 2 },
+];
+
+/* One grade at a time. To move up from a level the kid has to have shown
+   that level's own topics: at least half of them, each answered GATE_TRIES
+   times and right GATE_ACCURACY of the time. Without this, four squaring
+   problems rated a 4th grader as 7th grade, skipping fractions, decimals and
+   percentages entirely.
+
+   "Right often enough" is whichever is kinder of the lifetime rate and the
+   recent one: the recent one alone let a single slip re-close a level they
+   had already passed, and the lifetime one alone made a kid who started
+   shaky and then got good wait far too long. Falling back takes both. */
+export const GATE_TRIES = 5;
+export const GATE_ACCURACY = 0.8;
+/** Share of drills aimed at the current level's gate while it is still shut. */
+export const DRILL_GATE_SHARE = 0.35;
+
+/* Each level's own topics, matching the grade descriptions on the hero
+   screen, and only topics that level can actually serve (a test checks). Skill tiers alone could not be used: 7th and 8th grade would both
+   have been solving for x, so passing it jumped two levels at once. */
+export const LEVEL_GATES = {
+  1: ['add_small', 'sub_small'],
+  // Bigger adding and subtracting cannot be gates here: level 2 tiles only
+  // go to 10, so they never come up and the climb stalled for good.
+  2: ['mult_easy'],
+  3: ['mult_hard', 'div_easy'],
+  4: ['div_hard'],
+  5: ['fractions', 'decimals'],
+  6: ['percent', 'integers', 'ratio'],
+  7: ['order_ops', 'exponents'],
+  8: ['solve_x'],
+};
+
+/** The topics a level has to show before the next one opens. */
+export function gateSkills(level) {
+  return (LEVEL_GATES[level] || []).map(id => SKILL_BY_ID[id]).filter(Boolean);
+}
+
+/** Where a kid stands on a level's gate: each topic's progress, and whether it is open. */
+export function gateStatus(mastery, level) {
+  const skills = gateSkills(level).map(s => {
+    const r = mastery.skills[s.id];
+    const tries = r?.attempts || 0;
+    const rate = tries ? Math.max(r.correct / tries, r.ema) : 0;
+    return { id: s.id, label: s.label, tries, ok: tries >= GATE_TRIES && rate >= GATE_ACCURACY };
+  });
+  // Two topics means both; three means any two.
+  const need = skills.length <= 2 ? skills.length : Math.ceil(skills.length / 2);
+  return { level, skills, need, passed: !skills.length || skills.filter(x => x.ok).length >= need };
+}
+
+function gradeFloor(mastery, grade) {
+  const seeded = GRADE_BY_ID[grade]?.level || 0;
+  if (!seeded) return 1;
+  const past = Math.max(0, totalAttempts(mastery) - GRADE_GRACE_ATTEMPTS);
+  const byCount = Math.floor(past / GRADE_DECAY_ATTEMPTS);
+  const acc = overallAccuracy(mastery);
+  const hold = GRADE_HOLD_ACCURACY.find(h => acc >= h.atLeast);
+  return Math.max(1, Math.min(MAX_LEVEL, seeded - Math.min(byCount, hold ? hold.maxDrop : Infinity)));
+}
+
+/* The level is the grade floor, then up one for every gate in a row that has
+   been passed. There used to be a second cap from the overall record as well,
+   but it swung whenever a new skill was started (few tries count for little),
+   and every swing dropped the kid levels and then jumped them back. */
+export function difficultyLevel(mastery, grade = 0) {
+  let level = gradeFloor(mastery, grade);
+  while (level < MAX_LEVEL && gateStatus(mastery, level).passed) level += 1;
+  return level;
+}
+
+/** What stands between a kid and the next level, for the camp screen. Null at the top. */
+export function nextLevelNeeds(mastery, grade = 0) {
+  const level = difficultyLevel(mastery, grade);
+  if (level >= MAX_LEVEL) return null;
+  const gate = gateStatus(mastery, level);
+  return { level, next: level + 1, gate };
+}
+
+/** Which operator runes the profile is allowed to find, given where they are. */
+export function unlockedOps(mastery, grade = 0) {
+  const ops = ['+', '-'];
+  const addOk = skillScore(mastery.skills.add_small, 'add_small') > 0.5 || (mastery.skills.add_small?.attempts || 0) > 15;
+  if (addOk) ops.push('*');
+  const multOk = skillScore(mastery.skills.mult_easy, 'mult_easy') > 0.5 || (mastery.skills.mult_easy?.attempts || 0) > 20;
+  if (multOk) ops.push('/');
+  /* Powers need an earned route too. Declaring 7th grade was the only way in,
+     so a child who climbed there on their own never saw the rune. */
+  const hardMultOk = skillScore(mastery.skills.mult_hard, 'mult_hard') > 0.6 && (mastery.skills.mult_hard?.attempts || 0) >= 12;
+  if (hardMultOk) ops.push('^');
+  // A third grader is being taught multiplication whether or not they are
+  // good at it yet, so the grade adds operators it never takes away.
+  for (const op of GRADE_BY_ID[grade]?.ops || []) if (!ops.includes(op)) ops.push(op);
+  // Fixed order so the rune row never reshuffles between renders. The power
+  // rune has to be in this list or the grade that unlocks it gets filtered out.
+  return ['+', '-', '*', '/', '^'].filter(o => ops.includes(o));
+}
+
+/* --------------------------------------------------------------- tiles ---
+   Hand generation is where adaptation actually bites. We aim the hand at the
+   weakest skill the player has the runes for, so the tiles in front of them
+   make that skill the attractive play. */
+const TILE_RANGE = {
+  1: [1, 9], 2: [1, 10], 3: [2, 12], 4: [2, 15], 5: [3, 20],
+  6: [3, 20], 7: [4, 25], 8: [4, 25], 9: [5, 30],
+};
+
+export const MAX_LEVEL = 9;
+
+/* Negative tiles start appearing once integers are on the syllabus. Capped at
+   two per hand: a hand that is mostly negative has very few legal strikes and
+   reads as a puzzle with no answer. */
+export function negativeTilesFor(level) {
+  if (level < 6) return 0;
+  return level >= 8 ? 2 : 1;
+}
+
+export function tileRangeFor(level) { return TILE_RANGE[level] || TILE_RANGE[MAX_LEVEL]; }
+
+/* Which skill should this hand be built around?
+   An untouched skill scores 0, so simply taking the minimum would always aim
+   at whatever the kid has never tried and never revisit the fact they keep
+   missing. Known-weak beats unknown, with an occasional deliberate
+   introduction so new skills still get their first exposure. */
+function weakestTargetSkill(rng, mastery, runes, level) {
+  const candidates = SKILLS.filter(s => s.op && runes.includes(s.op) && s.tier <= level + 1);
+  if (candidates.length === 0) return null;
+
+  const tried = candidates.filter(s => (mastery.skills[s.id]?.attempts || 0) >= 3);
+  const untried = candidates.filter(s => (mastery.skills[s.id]?.attempts || 0) < 3 && s.tier <= level);
+
+  if (untried.length && (tried.length === 0 || rng() < 0.25)) {
+    return untried[Math.floor(rng() * untried.length)];
+  }
+  if (!tried.length) return candidates[Math.floor(rng() * candidates.length)];
+  return tried.reduce((a, b) => (skillScore(mastery.skills[b.id], b.id) < skillScore(mastery.skills[a.id], a.id) ? b : a));
+}
+
+/* Seeds for each skill, all clamped to the level's tile range so the damage
+   ceiling stays predictable. Enemy stats are budgeted against that ceiling,
+   so a rogue oversized tile would quietly break the balance. */
+function seedFor(rng, skillId, lo, hi) {
+  const R = (a, b) => ri(rng, Math.max(lo, Math.min(a, hi)), Math.max(lo, Math.min(b, hi)));
+  switch (skillId) {
+    case 'add_small': return [R(2, 9), R(2, 9)];
+    case 'sub_small': { const b = R(2, 9); return [Math.min(hi, b + R(2, 9)), b]; }
+    case 'add_big':   return hi >= 11 ? [R(11, hi), R(8, hi)] : null;
+    case 'sub_big':   { if (hi < 12) return null; const b = R(8, Math.floor(hi / 2)); return [Math.min(hi, b + R(6, hi)), b]; }
+    case 'mult_easy': return [R(2, 5), R(3, 9)];
+    case 'mult_hard': return hi >= 6 ? [R(6, Math.min(12, hi)), R(4, hi)] : null;
+    case 'div_easy':  { const b = R(2, 5); const q = R(2, Math.floor(hi / b) || 2); return b * q <= hi ? [b * q, b] : null; }
+    case 'div_hard':  { if (hi < 12) return null; const b = R(6, Math.min(12, hi)); const q = Math.max(2, Math.floor(hi / b)); return b * q <= hi ? [b * q, b] : null; }
+    default: return null;
+  }
+}
+
+/** Draw a hand of number tiles, biased toward giving the target skill a home. */
+export function generateHand(rng, { mastery, runes, size = 5, depth = 1, grade = 0 }) {
+  const level = difficultyLevel(mastery, grade);
+  const [lo, hi] = tileRangeFor(level);
+  const tiles = [];
+
+  const target = weakestTargetSkill(rng, mastery, runes, level);
+  if (target && rng() < 0.7) {
+    const seed = seedFor(rng, target.id, lo, hi);
+    if (seed) tiles.push(...seed);
+  }
+  while (tiles.length < size) tiles.push(ri(rng, lo, hi));
+
+  const out = tiles.slice(0, size).map((v, i) => ({
+    id: `t${i}_${Math.floor(rng() * 1e6)}`,
+    value: Math.max(lo, Math.min(hi, v)),
+  }));
+
+  /* Flip a tile or two negative once integers are on the syllabus. Each flip
+     is undone if it would leave the hand with no legal strike at all, which
+     is the one thing a hand must never be. */
+  for (let k = 0; k < negativeTilesFor(level); k++) {
+    if (rng() > 0.5) continue;
+    const idx = Math.floor(rng() * out.length);
+    if (out[idx].value < 0) continue;
+    const before = out[idx].value;
+    out[idx].value = -before;
+    if (legalPlays(out, runes).length === 0) out[idx].value = before;
+  }
+
+  return out;
+}
+
+/* --------------------------------------------------------------- drills --
+   On a built turn the player chooses the numbers, which means they can spend
+   a whole run never once making the fact they are worst at. Drill turns take
+   the choice away and hand them a problem, weighted toward exactly what they
+   have been dodging. This is the only part of the game that picks for them,
+   which is why it is also the only part with a clock. */
+
+/** Turn a stored fact key such as "7*8" back into a problem. */
+export function parseFactKey(key) {
+  const m = /^(\d+)([+\-*/^])(\d+)$/.exec(key || '');
+  if (!m) return null;
+  const a = Number(m[1]), op = m[2], b = Number(m[3]);
+  if (!isLegal(a, op, b)) return null;
+  return { a, op, b };
+}
+
+/** A fresh problem in a given skill, sized to the player's current level. */
+export function problemForSkill(rng, skillId, level) {
+  const skill = SKILL_BY_ID[skillId];
+  if (!skill || !skill.op) return null;
+  const [lo, hi] = tileRangeFor(level);
+  const seed = seedFor(rng, skillId, lo, hi);
+  if (!seed) return null;
+  const [a, b] = seed;
+  if (!isLegal(a, skill.op, b)) return null;
+  return { a, op: skill.op, b };
+}
+
+/* Mostly what they avoid, with some they know mixed in. All-weak every time
+   reads as punishment, and a kid who only ever meets their worst fact stops
+   playing, which teaches nothing at all. */
+export const DRILL_WEAK_SHARE = 0.65;
+
+/** A middle school problem the tile mechanic cannot express. */
+function askedProblem(rng, skillId) {
+  const gens = ASKED[skillId];
+  if (!gens || !gens.length) return null;
+  const made = pick(rng, gens)(rng);
+  if (!made || !made.prompt || made.answer === undefined || made.answer === null) return null;
+  const value = typeof made.answer === 'number' ? made.answer : made.answer.n / made.answer.d;
+  if (!Number.isFinite(value)) return null;
+  return { kind: 'text', skill: skillId, fact: null, prompt: made.prompt, answer: made.answer };
+}
+
+function arithProblem(rng, skillId, level) {
+  const prob = problemForSkill(rng, skillId, level);
+  if (!prob) return null;
+  return {
+    kind: 'arith',
+    ...prob,
+    answer: evaluate(prob.a, prob.op, prob.b),
+    skill: classify(prob.a, prob.op, prob.b),
+    fact: factKey(prob.a, prob.op, prob.b),
+  };
+}
+
+export function pickDrill(rng, mastery, runes, level) {
+  /* Arithmetic gets a level of stretch, because a harder times table is the
+     same skill one step on. A middle school topic is not: serving percentages
+     to a fourth grader is not a stretch, it is a different subject, and a
+     boss duel made of them is a wall they cannot climb. So those need the
+     level to have actually arrived. */
+  const arith = SKILLS.filter(s => s.op && runes.includes(s.op) && s.tier <= level + 1);
+  const asked = SKILLS.filter(s => ASKED[s.id] && s.tier <= level);
+  const all = [...new Set([...arith, ...asked])];
+  if (!all.length) return null;
+
+  /* A skill can be both: exponents has an operator AND written problems like
+     roots, so which form comes up is a coin toss. */
+  const fromSkill = skill => {
+    const canAsk = !!ASKED[skill.id];
+    const canBuild = !!(skill.op && runes.includes(skill.op));
+    if (canAsk && (!canBuild || rng() < 0.6)) {
+      const p = askedProblem(rng, skill.id);
+      if (p) return p;
+    }
+    if (canBuild) {
+      const p = arithProblem(rng, skill.id, level);
+      if (p) return p;
+    }
+    return canAsk ? askedProblem(rng, skill.id) : null;
+  };
+
+  /* Levels are climbed one at a time by showing the current level's own
+     topics, so drills aim at the ones still to show. Without this a topic
+     like dividing by 6-12 came up in 3% of drills and the climb stalled. */
+  const gate = gateStatus(mastery, level);
+  if (!gate.passed && rng() < DRILL_GATE_SHARE) {
+    // Only topics not yet tried enough: one tried plenty and still shaky is
+    // what the weak-fact drills below are for.
+    const open = gate.skills.filter(x => x.tries < GATE_TRIES).map(x => SKILL_BY_ID[x.id])
+      .filter(sk => all.includes(sk));
+    if (open.length) {
+      const p = fromSkill(open[Math.floor(rng() * open.length)]);
+      if (p) return { ...p, weak: false, gate: true };
+    }
+  }
+
+  if (rng() < DRILL_WEAK_SHARE) {
+    const shaky = shakyFacts(mastery, 12)
+      .map(f => ({ f, parsed: parseFactKey(f.key) }))
+      .filter(x => x.parsed && runes.includes(x.parsed.op));
+    if (shaky.length && rng() < 0.6) {
+      const pool = shaky.slice(0, 6);
+      const { a, op, b } = pool[Math.floor(rng() * pool.length)].parsed;
+      return { kind: 'arith', a, op, b, answer: evaluate(a, op, b),
+               skill: classify(a, op, b), fact: factKey(a, op, b), weak: true };
+    }
+    const tried = all.filter(s => (mastery.skills[s.id]?.attempts || 0) >= 3);
+    const pool = tried.length ? tried : all;
+    const target = pool.reduce((x, y) =>
+      (skillScore(mastery.skills[y.id], y.id) < skillScore(mastery.skills[x.id], x.id) ? y : x));
+    const p = fromSkill(target);
+    if (p) return { ...p, weak: true };
+  }
+
+  for (let tries = 0; tries < 12; tries++) {
+    const p = fromSkill(all[Math.floor(rng() * all.length)]);
+    if (p) return { ...p, weak: false };
+  }
+  return null;
+}
+
+/* How long they get. Taken from how fast this child already answers this kind
+   of problem, not a number picked out of the air: a fixed countdown is
+   trivial for the quick kid and demoralising for the slower one, and it
+   punishes the slower one forever. The window tightens on its own as their
+   average comes down. */
+export const DRILL_MIN_MS = 4000;
+export const DRILL_MAX_MS = 20000;
+export const DRILL_DEFAULT_MS = 12000;
+
+export function drillAllowanceMs(mastery, { skill, fact }) {
+  const f = fact && mastery.facts[fact];
+  const s = skill && mastery.skills[skill];
+  let avg = null;
+  if (f && f.attempts >= 2) avg = f.totalMs / f.attempts;
+  else if (s && s.attempts >= 4) avg = s.totalMs / s.attempts;
+  if (avg === null) return DRILL_DEFAULT_MS;
+  // Their own pace plus a moment to read the problem.
+  const allowance = avg * 1.6 + 1500;
+  return Math.round(Math.max(DRILL_MIN_MS, Math.min(DRILL_MAX_MS, allowance)));
+}
+
+/* The whole-duel clock. Long enough to answer every question at this child's
+   own pace with room to spare, so running it out means they stalled rather
+   than that they are simply a slower thinker. */
+export function averageAnswerMs(mastery) {
+  let ms = 0, n = 0;
+  for (const s of SKILLS) {
+    const rec = mastery.skills[s.id];
+    if (rec?.attempts) { ms += rec.totalMs; n += rec.attempts; }
+  }
+  return n ? ms / n : 6000;
+}
+
+export function bossFightMs(mastery, depth) {
+  const turns = Math.ceil(turnsFor(depth, { boss: true }));
+  const per = Math.max(DRILL_MIN_MS, Math.min(DRILL_MAX_MS, averageAnswerMs(mastery) * 1.6 + 1500));
+  return Math.round(turns * per * 1.35);
+}
+
+/* -------------------------------------------------------------- answers --
+   Up to fifth grade every answer is a whole number. Percentages, fractions
+   and negatives break that, so answers are parsed rather than compared as
+   integers. Equivalent fractions are accepted, because refusing 6/8 when the
+   child has correctly worked out three quarters teaches nothing except that
+   the game is fussy; the simplest form is mentioned instead. */
+export function parseAnswer(text) {
+  const t = String(text ?? '').trim().replace(/\u2212/g, '-');
+  if (!t) return null;
+  const frac = /^(-?\d+)\s*\/\s*(\d+)$/.exec(t);
+  if (frac) {
+    const n = Number(frac[1]), d = Number(frac[2]);
+    if (!d) return null;
+    return { value: n / d, n, d };
+  }
+  if (!/^-?\d+(\.\d+)?$/.test(t)) return null;
+  return { value: Number(t) };
+}
+
+/* Keypad input, kept here so the rules are testable: one decimal point, one
+   slash, never both, and a minus only at the front. Typing ".5" quietly
+   becomes "0.5" because that is what a child means by it. */
+export function typeInto(current, key) {
+  const cur = String(current ?? '');
+  if (key === 'back') return cur.slice(0, -1);
+  if (cur.length >= 8) return cur;
+  if (key === '.') {
+    if (cur.includes('.') || cur.includes('/')) return cur;
+    return (cur === '' || cur === '-') ? `${cur}0.` : `${cur}.`;
+  }
+  if (key === '/') {
+    if (cur === '' || cur === '-' || cur.includes('/') || cur.includes('.')) return cur;
+    return `${cur}/`;
+  }
+  if (key === '-') return cur === '' ? '-' : cur;
+  if (!/^[0-9]$/.test(key)) return cur;
+  // A denominator cannot start with nought, or "3/0" becomes typeable and
+  // there is no number at the end of it.
+  if (key === '0' && cur.endsWith('/')) return cur;
+  return cur + key;
+}
+
+export function answerValue(expected) {
+  return typeof expected === 'number' ? expected : expected.n / expected.d;
+}
+
+/** How an expected answer should be written on screen. */
+export function formatAnswer(expected) {
+  return typeof expected === 'number' ? String(expected) : `${expected.n}/${expected.d}`;
+}
+
+export function checkAnswer(text, expected) {
+  const given = parseAnswer(text);
+  if (!given) return { ok: false, given: null };
+  const target = answerValue(expected);
+  const ok = Math.abs(given.value - target) < 1e-9;
+  let note = null;
+  if (ok && given.d) {
+    const simplest = simplifyFraction(given.n, given.d);
+    const asText = typeof simplest === 'number' ? String(simplest) : `${simplest.n}/${simplest.d}`;
+    if (asText !== `${given.n}/${given.d}`) note = `Simplest form is ${asText}.`;
+  }
+  return { ok, given, note };
+}
+
+/* -------------------------------------------------------------- strikes --
+   A strike is: tile a, operator, tile b, and the answer the player typed. */
+
+/** Is this pair legal for this operator? Illegal pairs are greyed out in the UI. */
+/* A strike has to produce a whole number of at least 1. Stating it that way
+   rather than as per-operator rules is what lets negative tiles work: 5 + -3
+   and -4 x -3 are fine, -3 - 5 is not, and nothing else had to change. */
+export function isLegal(a, op, b) {
+  if (op === '^') {
+    if (b < 2 || b > 3) return false;            // squares and cubes only
+    const r = Math.pow(a, b);
+    return Number.isInteger(r) && r >= 1 && r <= 4000;
+  }
+  if (op === '/' && (b === 0 || a % b !== 0)) return false;
+  const r = evaluate(a, op, b);
+  return Number.isInteger(r) && r >= 1;
+}
+
+export function evaluate(a, op, b) {
+  switch (op) {
+    case '+': return a + b;
+    case '-': return a - b;
+    case '*': return a * b;
+    case '/': return a / b;
+    case '^': return Math.pow(a, b);
+    default: return NaN;
+  }
+}
+
+/** Every legal play available from a hand. Used by the hint system and tests. */
+export function legalPlays(tiles, runes) {
+  const out = [];
+  for (let i = 0; i < tiles.length; i++) {
+    for (let j = 0; j < tiles.length; j++) {
+      if (i === j) continue;
+      for (const op of runes) {
+        const a = tiles[i].value, b = tiles[j].value;
+        if (isLegal(a, op, b)) out.push({ i, j, op, a, b, result: evaluate(a, op, b) });
+      }
+    }
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------- damage ----
+   Order: raw result -> relic flat/op bonuses -> ward multiplier -> combo
+   -> subtract armor. Armor last so a ward can punch through it, which is the
+   whole reason a smaller ward-matching number can beat a bigger raw one. */
+export function computeDamage({ result, op, ward, resist, resistAt, armor, relics, combo, ms, isFirstHit, typeMult = 1 }) {
+  let dmg = result;
+  const owned = relics.map(id => RELIC_BY_ID[id]).filter(Boolean);
+
+  for (const r of owned) {
+    if (r.flat) dmg += r.flat;
+    if (r.opBonus && r.opBonus[op]) dmg += r.opBonus[op];
+    if (r.slowBonus && ms > 6000) dmg += r.slowBonus;
+  }
+  let pct = 0;
+  for (const r of owned) {
+    if (r.pctIf && r.pctIf(result)) pct += r.pct;
+    if (r.fastPct && ms < 4000) pct += r.fastPct;
+  }
+  dmg = dmg * (1 + pct);
+
+  const w = WARDS[ward] || WARDS.none;
+  const warded = w.test(result);
+  if (warded) dmg *= w.mult;
+
+  /* Resist is applied after the ward so a ward-matching number can still be
+     the best play even when it is on the wrong side of the threshold. */
+  const rz = RESISTS[resist] || RESISTS.none;
+  const resisted = rz.id !== 'none' && !rz.cap && rz.apply(result, resistAt) < 1;
+  if (resisted) dmg *= rz.apply(result, resistAt);
+  const capped = !!rz.cap && dmg > resistAt;
+  if (capped) dmg = resistAt;
+
+  const comboStep = owned.some(r => r.comboX2) ? 0.2 : 0.1;
+  dmg *= 1 + Math.min(5, combo) * comboStep;
+
+  if (isFirstHit && owned.some(r => r.firstHitX2)) dmg *= 2;
+
+  // Type matchup last before armor, so a strong matchup can punch through it.
+  dmg *= typeMult;
+
+  const final = Math.max(1, Math.round(dmg) - armor);
+  return { damage: Math.max(1, final), warded, resisted, capped, blockedByArmor: Math.round(dmg) <= armor };
+}
+
+/* -------------------------------------------------------------- enemies --
+   Everything here is derived from `bestHit`: the largest damage the player
+   can realistically produce with the tiles and runes they currently have.
+   Tying enemy health to that is what keeps a fight the same length whether
+   the kid is adding to 20 or multiplying twelves, and it means the balance
+   adapts automatically as they get better instead of needing new tables. */
+
+/** Largest damage the player can plausibly reach on one strike right now. */
+export function bestHitEstimate(runes, level) {
+  const [, hi] = tileRangeFor(level);
+  if (runes.includes('*')) return Math.round(hi * (hi - 1) * 0.7);
+  return hi * 2;
+}
+
+/** Turn budget for a fight: shortest early, longest at the bottom of the run. */
+export function turnsFor(depth, { elite = false, boss = false } = {}) {
+  const base = 2.6 + depth * 0.09;
+  return base * (boss ? 2.0 : elite ? 1.5 : 1);
+}
+
+function resolveIntent(it, budget) {
+  switch (it.type) {
+    case 'attack':    return { type: 'attack', dmg: Math.max(1, Math.round(budget.hitDmg * (it.w || 1))) };
+    case 'bigAttack': return { type: 'bigAttack', dmg: Math.max(2, Math.round(budget.hitDmg * (it.w || 1.7))) };
+    case 'armorUp':   return { type: 'armorUp', amount: Math.max(1, Math.round(budget.bestHit * 0.12)) };
+    case 'heal':      return { type: 'heal', amount: Math.max(1, Math.round(budget.maxHp * 0.18)) };
+    case 'shield':    return { type: 'shield', value: budget.shieldValue };
+    default:          return { type: it.type };
+  }
+}
+
+/* A shield the player can never build is a wall, not a puzzle, so the target
+   is always a number their own tile range can actually produce. */
+function reachableTarget(rng, runes, level) {
+  const [lo, hi] = tileRangeFor(level);
+  const a = ri(rng, Math.max(2, lo), hi);
+  const b = ri(rng, Math.max(2, lo), hi);
+  if (runes.includes('*')) return a * b;
+  return a + b;
+}
+
+/** The damage a thinking player will actually land once a resist is in play. */
+export function effectiveHit(bestHit, resist, resistAt) {
+  if (resist === 'cap') return resistAt;
+  if (resist === 'over') return Math.max(resistAt, bestHit * 0.5);
+  return bestHit;
+}
+
+/* What one answer is worth in a boss duel. A duel has no tiles, so the player
+   cannot pick the big multiplication that bestHitEstimate assumes: they get
+   whatever problem the game hands them. Budgeting a duel against the building
+   ceiling makes it run about twice its intended length, and those extra turns
+   are extra damage taken. Sampling the actual drill picker is the honest
+   answer, since that is precisely what they will be asked. */
+export function expectedDrillDamage(rng, mastery, runes, level, samples = 48) {
+  /* Only calculations count. A written problem has no a-op-b to evaluate, and
+     averaging one in produced NaN, which made a boss's health NaN, which made
+     the duel impossible to ever win. The written-problem damage is taken FROM
+     this average, so including them here would be circular anyway. */
+  let sum = 0, n = 0;
+  for (let i = 0; i < samples; i++) {
+    const d = pickDrill(rng, mastery, runes, level);
+    if (!d || d.kind !== 'arith') continue;
+    const r = evaluate(d.a, d.op, d.b);
+    if (!Number.isFinite(r)) continue;
+    sum += r;
+    n++;
+  }
+  if (!n) return Math.max(1, Math.round(bestHitEstimate(runes, level) * 0.35));
+  return Math.max(1, sum / n);
+}
+
+export const WORLD_PRESSURE = 1.35;
+
+export function spawnEnemy(rng, depth, opts = {}) {
+  const { boss = false, elite = false, runes = ['+', '-'], level = 1, playerMaxHp = 50,
+          ceiling = null, armorBase = null, duel = false, season = null } = opts;
+  const tier = Math.max(1, Math.min(3, Math.ceil(depth / 3)));
+  let pool = boss ? BOSSES : ENEMIES.filter(e => e.tier <= tier + (elite ? 1 : 0));
+  /* In season, about half of what is met comes from the season's set. */
+  if (season) {
+    const set = SEASONAL_MONSTERS.filter(m => m.season === season
+      && (boss ? m.boss : !m.boss && m.tier <= tier + (elite ? 1 : 0)));
+    if (set.length && rng() < 0.5) pool = set;
+  }
+  const tpl = pick(rng, pool.length ? pool : ENEMIES);
+
+  const fallback = bestHitEstimate(runes, level);
+  const bestHit = Number.isFinite(ceiling) && ceiling > 0 ? ceiling : fallback;
+  /* Armor scales off the player's WEAKEST turn, not their average. Scaled to
+     the average, a level-eight drill turn delivering 80 ran into 70 armor and
+     did nothing at all: armor stopped being a puzzle and started deleting a
+     whole turn type. */
+  const armorFrom = Number.isFinite(armorBase) && armorBase > 0 ? armorBase : bestHit;
+  const turns = turnsFor(depth, { elite, boss });
+  const armor = Math.round(armorFrom * tpl.armorFrac);
+
+  /* Per-turn chip damage. A four-turn fight should cost a fifth of the
+     player's health, not half: the run has to survive fifteen of them. */
+  /* A duel is nothing but telegraphed blows you are meant to parry, so those
+     blows are heavy. Parrying one is clearly worth the answer; missing one
+     hurts. Without this a duel is the safest floor in the run, because a
+     fluent player blunts every hit and the fight carries no threat at all. */
+  /* The walkable world lets a kid do everything on a floor (trainers' relics,
+     the healer, quests), where the old menu was one thing per floor; the
+     soak bot then cleared every run. Enemies hit 20% harder to keep a careful
+     player under some pressure. */
+  const share = WORLD_PRESSURE * Math.min(0.07, 0.03 + depth * 0.002)
+    * (boss ? 1.3 : elite ? 1.15 : 1)
+    /* Nearly every duel turn is an attack now that jam and shield are gone,
+       where an ordinary boss attacks on about half its turns. The multiplier
+       is sized for that, not for the raw per-hit number. */
+    * (duel ? 1.2 : 1);
+  const hitDmg = Math.max(1, Math.round(playerMaxHp * share));
+
+  let resist = pick(rng, tpl.resist || ['none']);
+  /* Multiplication hands the player a damage ceiling an order of magnitude
+     above addition, which makes "multiply the two biggest tiles" correct
+     almost every turn and kills the thinking. Once x is in play, most enemies
+     therefore carry a ceiling-punishing resist, and "under" (which rewards
+     going big) is swapped out for one that does not. */
+  if (runes.includes('*') && (resist === 'under' || resist === 'cap' || (resist === 'none' && rng() < 0.75))) {
+    resist = 'over';
+  }
+  const resistAt = resist === 'none' ? 0 : Math.max(3, Math.round(bestHit * RESISTS[resist].share));
+
+  /* Health is budgeted after armor AND resist, so those are puzzles that change
+     which number you want rather than padding that makes the fight longer. */
+  const perTurn = Math.max(1, effectiveHit(bestHit, resist, resistAt) - armor);
+  const maxHp = Math.max(6, Math.round(perTurn * turns * tpl.hpW));
+  const budget = { bestHit, maxHp, hitDmg, shieldValue: reachableTarget(rng, runes, level) };
+
+  /* In a duel the player answers what they are given, so two of the moves
+     have nothing to bite on: there are no tiles to jam, and a shield asking
+     for an exact number cannot be met by a number you did not choose. Both
+     would be free turns that read as threats, so a duelling boss does not
+     have them. */
+  const intents = duel
+    ? (tpl.intents.filter(i => i.type !== 'jam' && i.type !== 'shield').length
+        ? tpl.intents.filter(i => i.type !== 'jam' && i.type !== 'shield')
+        : [{ type: 'attack', w: 1 }])
+    : tpl.intents;
+
+  return {
+    id: tpl.id,
+    name: (elite ? 'Elite ' : '') + tpl.name,
+    art: tpl.art,
+    type: tpl.type || 'light',
+    season: tpl.season || null,
+    boss: !!tpl.boss,
+    elite,
+    duel,
+    hp: maxHp,
+    maxHp,
+    armor,
+    ward: pick(rng, tpl.ward),
+    resist,
+    resistAt,
+    shield: 0,
+    intents: intents.map(it => resolveIntent(it, budget)),
+    intentIndex: 0,
+    depth,
+  };
+}
+
+/** Resolve the enemy's telegraphed move. Returns the events it produced. */
+export function enemyAct(enemy, player, rng) {
+  const intent = enemy.intents[enemy.intentIndex % enemy.intents.length];
+  enemy.intentIndex += 1;
+  const events = [];
+  // A move like Vine Wrap costs it this turn entirely.
+  if (enemy.skipNext) {
+    enemy.skipNext = false;
+    events.push({ type: 'skip', text: `${enemy.name} is tangled up and can't move!` });
+    return { intent, events };
+  }
+
+  switch (intent.type) {
+    case 'attack':
+    case 'bigAttack': {
+      const block = player.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+        .reduce((sum, r) => sum + (r.block || 0), 0);
+      // typeEdge is the enemy's matchup against whoever the player is fighting with.
+      const raw = Math.round((enemy.enraged ? intent.dmg * 2 : intent.dmg) * (enemy.typeEdge || 1) * weakness(enemy));
+      if (player.guard) {
+        player.guard = false;
+        events.push({ type: 'blocked', text: `Your shield blocks ${enemy.name}'s attack!` });
+        break;
+      }
+      const dmg = Math.max(1, raw - block);
+      player.hp -= dmg;
+      events.push({ type: 'damage', amount: dmg, text: `${enemy.name} hits you for ${dmg}.` });
+      break;
+    }
+    case 'armorUp':
+      enemy.armor += intent.amount;
+      events.push({ type: 'armor', text: `${enemy.name} hardens. Armor is now ${enemy.armor}.` });
+      break;
+    case 'heal': {
+      enemy.hp = Math.min(enemy.maxHp, enemy.hp + intent.amount);
+      events.push({ type: 'heal', text: `${enemy.name} heals ${intent.amount}.` });
+      break;
+    }
+    case 'shield': {
+      enemy.shield = intent.value;
+      events.push({ type: 'shield', text: `${enemy.name} raises a shield. Hit it for EXACTLY ${enemy.shield} to shatter it.` });
+      break;
+    }
+    case 'jam':
+      events.push({ type: 'jam', text: `${enemy.name} jams a tile. One of your tiles is locked next turn.` });
+      break;
+    default:
+      break;
+  }
+  return { intent, events };
+}
+
+/** A cursed enemy hits softer for a few attacks; each call uses one up. */
+function weakness(enemy, spend = true) {
+  const w = enemy.weak;
+  if (!w) return 1;
+  if (spend) { w.hits -= 1; if (w.hits <= 0) enemy.weak = null; }
+  return w.mult;
+}
+
+/** The one-turn warning the player plans against. */
+export function describeIntent(enemy) {
+  if (enemy.skipNext) return { icon: '\u{1F33F}', text: 'Tangled: skips its next move' };
+  const intent = enemy.intents[enemy.intentIndex % enemy.intents.length];
+  // Matches enemyAct exactly, so the warning is the number that lands.
+  const hit = n => Math.round((enemy.enraged ? n * 2 : n) * (enemy.typeEdge || 1) * weakness(enemy, false));
+  switch (intent.type) {
+    case 'attack': return { icon: '\u{1F5E1}\uFE0F', text: `Attack for ${hit(intent.dmg)}` };
+    case 'bigAttack': return { icon: '\u{1F4A5}', text: `BIG attack for ${hit(intent.dmg)}` };
+    case 'armorUp': return { icon: '\u{1F6E1}\uFE0F', text: `Armor +${intent.amount}` };
+    case 'heal': return { icon: '\u2764\uFE0F', text: `Heal ${intent.amount}` };
+    case 'shield': return { icon: '\u{1F512}', text: `Raise a ${intent.value} shield` };
+    case 'jam': return { icon: '\u{1F513}', text: 'Lock one of your tiles' };
+    default: return { icon: '?', text: 'Unknown' };
+  }
+}
+
+/* ----------------------------------------------------------------- map ---
+   A run is a column of floors, 2-3 node choices each, a boss every third.
+   A standard run ENDS at floor 20 with a win. Kids need a finish line, not a
+   treadmill: a session you can actually complete is worth more than one that
+   only ever ends in death. Endless mode unlocks after the first clear. */
+export const FINAL_DEPTH = 20;
+export const NODE_TYPES = ['battle', 'elite', 'riddle', 'treasure', 'shop', 'rest'];
+
+/* Two identical choices is not a choice, so a floor never repeats a node type
+   and always contains exactly one fight to anchor it. */
+/* A boss every third floor, and always one on the last floor of a standard
+   run so it ends on a duel rather than a slime. */
+export const BOSS_EVERY = 3;
+
+export function isBossFloor(depth) {
+  return depth % BOSS_EVERY === 0 || depth === FINAL_DEPTH;
+}
+
+export function generateFloor(rng, depth) {
+  if (isBossFloor(depth)) return [{ type: 'boss', depth }];
+
+  const fight = depth >= 3 && rng() < 0.28 ? 'elite' : 'battle';
+  const others = ['riddle', 'treasure', 'rest'];
+  if (depth >= 3) others.push('shop');
+  if (depth >= 4) others.push(fight === 'elite' ? 'battle' : 'elite');
+
+  const count = depth === 1 ? 2 : (rng() < 0.5 ? 2 : 3);
+  const nodes = [{ type: fight, depth }];
+  const pool = others.slice();
+  while (nodes.length < count && pool.length) {
+    const t = pool.splice(Math.floor(rng() * pool.length), 1)[0];
+    nodes.push({ type: t, depth });
+  }
+  // Shuffle so the fight is not always the first option on screen.
+  for (let i = nodes.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [nodes[i], nodes[j]] = [nodes[j], nodes[i]];
+  }
+  return nodes;
+}
+
+/* -------------------------------------------------------------- riddles --
+   Pick a riddle aimed at the player's level, avoiding immediate repeats. */
+export function generateRiddle(rng, mastery, recentIds = [], grade = 0) {
+  const level = difficultyLevel(mastery, grade);
+  let pool = RIDDLES.filter(r => r.tier <= level + 1 && !recentIds.includes(r.id));
+  if (pool.length === 0) pool = RIDDLES.filter(r => !recentIds.includes(r.id));
+  if (pool.length === 0) pool = RIDDLES;
+  const tpl = pick(rng, pool);
+  const made = tpl.make(rng);
+  return { id: tpl.id, skill: tpl.skill, text: made.text, answer: made.answer };
+}
+
+/* --------------------------------------------------------------- relics --
+   Offer three the player does not already hold. */
+export function offerRelics(rng, owned, count = 3) {
+  const pool = RELICS.filter(r => !owned.includes(r.id));
+  const out = [];
+  const copy = pool.slice();
+  while (out.length < count && copy.length) {
+    out.push(copy.splice(Math.floor(rng() * copy.length), 1)[0]);
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ run --
+   The run object the UI drives. Held in memory; only mastery + meta persist. */
+export function newRun(seed, profile, endless = false) {
+  const rng = makeRng(seed);
+  const ops = profile.mastery ? unlockedOps(profile.mastery, profile.grade) : ['+', '-'];
+  for (const op of profile.meta?.startRunes || []) if (!ops.includes(op)) ops.push(op);
+  return {
+    seed,
+    rng,
+    depth: 1,
+    endless: !!endless,
+    floorNodes: generateFloor(rng, 1),
+    player: {
+      hp: 50 + (profile.meta?.bonusHp || 0),
+      maxHp: 50 + (profile.meta?.bonusHp || 0),
+      runes: ops,
+      relics: [],
+      gold: 0,
+      combo: 0,
+    },
+    recentRiddles: [],
+    stats: { battlesWon: 0, correct: 0, wrong: 0, deepest: 1 },
+    over: false,
+  };
+}
+
+export function handSize(player) {
+  const bonus = player.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+    .reduce((sum, r) => sum + (r.handBonus || 0), 0);
+  return 5 + bonus;
+}
+
+export function reshuffles(player) {
+  const bonus = player.relics.map(id => RELIC_BY_ID[id]).filter(Boolean)
+    .reduce((sum, r) => sum + (r.reshuffleBonus || 0), 0);
+  return 1 + bonus;
+}
+
+export function hasRelic(player, id) { return player.relics.includes(id); }
+
+export { classify, factKey, SKILLS, SKILL_BY_ID, WARDS, RESISTS, RELICS, RELIC_BY_ID, GRADES, GRADE_BY_ID };
